@@ -1,0 +1,22 @@
+{
+  "recorded_at": "2026-08-24T00:00:00Z",
+  "request": {
+    "method": "POST",
+    "path": "/v1/customers",
+    "body": { "name": "Test Buyer", "email": "buyer@example.com", "contact": "9999999999" }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "cust_TTEw8l50tbC4iN",
+      "entity": "customer",
+      "name": "Test Buyer",
+      "email": "buyer@example.com",
+      "contact": "9999999999",
+      "gstin": null,
+      "notes": [],
+      "shipping_address": [],
+      "created_at": 1787494377
+    }
+  }
+}

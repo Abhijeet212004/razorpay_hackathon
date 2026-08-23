@@ -27,6 +27,11 @@ import type {
  * The order row is created here rather than in the authorisation transaction, and that
  * ordering is load-bearing: the reaper releases a hold only when no order row exists for
  * its intent, so an order created earlier would make a crashed execution unreapable.
+ *
+ * Within this function the row is written and committed BEFORE the outbound call. A
+ * timeout must not look like a call that never happened: it leaves a payment that may
+ * well exist, and reaping the hold would under-count money that moved. The row in
+ * SUBMITTING is what says "a call may have been made".
  */
 
 export interface ExecutorDeps {
@@ -104,13 +109,15 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
         if (existing !== null) return { existing, orderId: existing.orderId };
 
         const orderId = `ord_${randomUUID()}`;
+        // Committed before the call. From here on, the absence of this row means the
+        // executor is certain it never reached the rail.
         await repo.insertOrder(client, {
           orderId,
           intentId: request.intentId,
           mandateId: request.mandateId,
           merchantId: request.merchantId,
           amountPaise: request.amountPaise,
-          state: "AUTHORISED",
+          state: "SUBMITTING",
           railOrderId: null,
           railPaymentId: null,
           idempotencyKey: key,
@@ -118,9 +125,9 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
         return { existing: null, orderId };
       });
 
-      if (claimed.existing !== null) {
-        // The same intent already reached the rail. Returning the existing order is what
-        // makes a replayed execution a no-op rather than a second payment.
+      if (claimed.existing !== null && claimed.existing.state !== "SUBMITTING") {
+        // The same intent already reached the rail and resolved. Returning the existing
+        // order is what makes a replayed execution a no-op rather than a second payment.
         return {
           orderId: claimed.existing.orderId,
           state: claimed.existing.state,
@@ -128,6 +135,13 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
           idempotencyKey: claimed.existing.idempotencyKey,
         };
       }
+
+      // A row left in SUBMITTING falls through to the call below on purpose. The
+      // idempotency key is sha256(intent_id) and therefore identical, so the rail either
+      // returns the order it already has or creates the one it never did. With a
+      // deterministic idempotency key, re-issuing the create IS the read — this is not a
+      // blind retry and cannot produce a second charge. Do not "fix" it into an early
+      // return.
 
       // Outside any transaction: the rail call must not hold a database lock either.
       let railOrderId: string | null = null;

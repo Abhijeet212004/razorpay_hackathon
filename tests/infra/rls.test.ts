@@ -126,6 +126,60 @@ describe("row level security with FORCE", () => {
     }
   });
 
+  /**
+   * operator_metrics is the one table read across merchants, and it is deliberately
+   * outside row level security. That is only safe because it holds no identifiers, which
+   * today is a fact about the migration rather than a property anything enforces.
+   *
+   * This is the enforcement. A later migration adding "just one id for debugging" to the
+   * only table that crosses the tenant boundary fails here instead of quietly leaking.
+   */
+  it("keeps operator_metrics free of identifiers", async () => {
+    const ALLOWED = new Set([
+      "merchant_id",        // the tenant key itself, and the only identifier permitted
+      "window_start",
+      "decisions_total",
+      "denials_total",
+      "denials_by_code",    // counts keyed by reason code, never by subject
+      "gmv_paise",
+      "active_mandates",
+      "reservations_held",
+      "chain_status",
+      "breaker_trips",
+      "refreshed_at",
+    ]);
+
+    const result = await db.superuser.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'operator_metrics' ORDER BY column_name`,
+    );
+    const columns = result.rows.map((r) => r.column_name);
+
+    expect(columns.length).toBeGreaterThan(0);
+
+    const unexpected = columns.filter((c) => !ALLOWED.has(c));
+    expect(
+      unexpected,
+      "a new column on operator_metrics must be reviewed: this table is read across merchants",
+    ).toEqual([]);
+
+    // Belt and braces, so a plausible-looking name cannot be added to the allowlist
+    // without someone noticing what it is.
+    const identifierish = columns.filter(
+      (c) => c !== "merchant_id" && /(^|_)(id|ref|intent|mandate|quote|psu|pseudonym|user|subject|agent)(_|$)/.test(c),
+    );
+    expect(identifierish, "operator_metrics must hold counts and sums only").toEqual([]);
+  });
+
+  it("keeps operator_metrics outside row level security, deliberately", async () => {
+    // Not an oversight. It is safe precisely because of the assertion above, and putting
+    // it under RLS would make the cross-merchant read impossible without BYPASSRLS.
+    const result = await db.superuser.query<{ relrowsecurity: boolean }>(
+      `SELECT relrowsecurity FROM pg_class WHERE relname = 'operator_metrics'`,
+    );
+    expect(result.rows[0]?.relrowsecurity).toBe(false);
+  });
+
   it("grants BYPASSRLS to no role", async () => {
     const result = await db.superuser.query<{ rolname: string }>(
       `SELECT rolname FROM pg_roles WHERE rolbypassrls AND rolname LIKE 'agentkit%'`,

@@ -32,6 +32,8 @@ export interface ReplayRailOptions {
   readonly failPayments?: boolean;
   /** Accept the order, then never send a terminal webhook — produces AMBIGUOUS. */
   readonly goSilent?: boolean;
+  /** Fixed port for the compose service; 0 (the default) picks a free one for tests. */
+  readonly port?: number;
 }
 
 export interface ReplayRail {
@@ -189,7 +191,8 @@ export async function startReplayRail(options: ReplayRailOptions): Promise<Repla
     });
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const host = options.port === undefined ? "127.0.0.1" : "0.0.0.0";
+  await new Promise<void>((resolve) => server.listen(options.port ?? 0, host, resolve));
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : 0;
 

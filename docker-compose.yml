@@ -1,0 +1,192 @@
+# docker compose up, on a machine with no accounts and no keys, reaches a seeded working
+# system. RAIL=replay is the default and needs no credentials at all.
+#
+# Every dependency is health-gated. Most "it didn't work" is a race on Postgres.
+
+name: agentkit
+
+x-image: &image
+  image: ${AGENTKIT_IMAGE:-ghcr.io/abhijeet212004/agentkit:latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-db-env: &db-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: agentkit
+  PG_KERNEL_PASSWORD: ${PG_KERNEL_PASSWORD:-agentkit}
+  PG_WORKER_PASSWORD: ${PG_WORKER_PASSWORD:-agentkit}
+  PG_CONSOLE_PASSWORD: ${PG_CONSOLE_PASSWORD:-agentkit}
+  PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD:-agentkit}
+  PG_OWNER_PASSWORD: ${PG_OWNER_PASSWORD:-agentkit}
+
+x-mode-env: &mode-env
+  RAIL: ${RAIL:-replay}
+  BRAIN: ${BRAIN:-scripted}
+  VERIFIER: ${VERIFIER:-scripted}
+  MERCHANT_ID: ${MERCHANT_ID:-mch_sharma_kirana}
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-whsec_replay_dev_only}
+  EXECUTOR_URL: http://executor:8081
+  EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:-executor-dev-token}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:58080}
+
+services:
+  postgres:
+    image: postgres:16.6-alpine@sha256:d0f363f8366fbc3f52d172c6e76bc27151c3d643b870e1062b4e8bfe65baf609
+    environment:
+      POSTGRES_USER: bootstrap
+      POSTGRES_PASSWORD: bootstrap
+      POSTGRES_DB: agentkit
+    command: ["postgres", "-c", "max_connections=200"]
+    ports:
+      # Uncommon on purpose: a judge is likely running their own Postgres on 5432.
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bootstrap -d agentkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Runs once and exits. Migrations, role passwords, signing keys and thirty days of seed
+  # data, all idempotent: `make up` twice does not double-seed.
+  bootstrap:
+    <<: *image
+    command: ["node", "dist/services/bootstrap/main.js"]
+    environment:
+      <<: [*db-env, *mode-env]
+      PGUSER: bootstrap
+      PGPASSWORD: bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # The recorded rail. Not in the RAIL=razorpay path, but harmless there.
+  replay:
+    <<: *image
+    command: ["node", "dist/services/replay/main.js"]
+    environment:
+      <<: *mode-env
+      PORT: "8090"
+      HEALTH_PORT: "8091"
+      WEBHOOK_URL: http://kernel:8080/agent/webhooks/razorpay
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8091/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  # The only service holding a payment credential, and the only one with no published
+  # port. Kernel and worker reach it on the internal network with a shared token.
+  executor:
+    <<: *image
+    command: ["node", "dist/services/executor/main.js"]
+    environment:
+      <<: [*db-env, *mode-env]
+      PORT: "8081"
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+      RZP_KEY_ID: ${RZP_KEY_ID:-rzp_test_replay}
+      RZP_KEY_SECRET: ${RZP_KEY_SECRET:-replay-has-no-real-secret}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  kernel:
+    <<: *image
+    command: ["node", "dist/services/kernel/main.js"]
+    environment:
+      <<: [*db-env, *mode-env]
+      PORT: "8080"
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+    ports:
+      - "58080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+      executor:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  worker:
+    <<: *image
+    command: ["node", "dist/services/worker/main.js"]
+    environment:
+      <<: [*db-env, *mode-env]
+      PORT: "8082"
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+      executor:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  web:
+    <<: *image
+    command: ["node", "dist/services/web/main.js"]
+    environment:
+      <<: [*db-env, *mode-env]
+      PORT: "8083"
+    ports:
+      - "58083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  buyer-agent:
+    <<: *image
+    command: ["node", "dist/services/buyer-agent/main.js"]
+    environment:
+      <<: *mode-env
+      PORT: "8084"
+      KERNEL_URL: http://kernel:8080
+    ports:
+      - "58084:8084"
+    depends_on:
+      kernel:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8084/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+volumes:
+  # Named, never a host bind-mount: bind-mounted Postgres data breaks on Windows.
+  pgdata:

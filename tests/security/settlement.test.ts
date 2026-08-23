@@ -1,10 +1,12 @@
 import { createHmac } from "node:crypto";
+import { createServer } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { authorize } from "../../src/modules/authorization/authorization.service.js";
 import { ingestWebhook } from "../../src/modules/reconciler/reconciler.service.js";
 import { releaseStaleReservations } from "../../src/modules/jobs/release-stale.job.js";
 import { reconcileAmbiguous } from "../../src/modules/jobs/reconcile-ambiguous.job.js";
 import { createHttpRail } from "../../src/modules/rail/rail.http.js";
+import { createExecutor } from "../../src/modules/executor/executor.service.js";
 import { ROLES } from "../../src/shared/db/roles.js";
 import { startTestDatabase, withMerchantContext, type TestDatabase } from "../support/postgres.js";
 import { TEST_WEBHOOK_SECRET, startTestRail, testKernel, type TestRail } from "../support/kernel.js";
@@ -384,5 +386,141 @@ describe("the reaper", () => {
     // Never reaped while the outcome is unknown: we do not know whether money moved.
     expect(states.int_submitted?.state).toBe("held");
     expect(states.int_ambiguous?.state).toBe("held");
+  });
+});
+
+/**
+ * The order row is written before the outbound call, so the absence of a row means the
+ * executor is certain it never reached the rail.
+ */
+describe("a timeout is not a call that never happened", () => {
+  let db: TestDatabase;
+  let agent: SeededAgent;
+  let quoteKey: SeededKey;
+  let mandateId: string;
+
+  beforeAll(async () => {
+    db = await startTestDatabase();
+    await seedMerchant(db.superuser);
+    const mandateKey = await seedSigningKey(db.superuser, "mandate");
+    quoteKey = await seedSigningKey(db.superuser, "quote");
+    agent = await seedAgent(db.superuser);
+    const subject = await seedSubject(db.superuser);
+    mandateId = await seedMandate(db.superuser, {
+      agentId: agent.agentId,
+      authEventId: subject.authEventId,
+      pseudonym: subject.pseudonym,
+      kid: mandateKey.kid,
+      silentThresholdPaise: 500_000n,
+      cumulativePaise: 5_000_000n,
+      velocityPerHour: 1_000,
+    });
+    await seedCapturedReservation(db.superuser, { mandateId, amountPaise: 1_000n, ageMs: 86_400_000 });
+  });
+
+  afterAll(async () => {
+    await db?.stop();
+  });
+
+  it("leaves an order row when the rail never answers, so the hold is not reaped", async () => {
+    // A rail that accepts the connection and never responds. The executor times out.
+    const blackHole = createServer((_req, res) => {
+      // Deliberately no response, and no destroy: the client must hit its own timeout.
+      void res;
+    });
+    await new Promise<void>((resolve) => blackHole.listen(0, "127.0.0.1", resolve));
+    const address = blackHole.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+
+    try {
+      const rail = createHttpRail({
+        mode: "replay",
+        baseUrl: `http://127.0.0.1:${port}`,
+        keyId: "k",
+        keySecret: "s",
+        timeoutMs: 300,
+      });
+      const executor = createExecutor({ pool: db.as(ROLES.kernel), rail });
+
+      const quote = await issueQuote(db.superuser, { mandateId, amountPaise: 31_000n, key: quoteKey });
+      const kernel = testKernel(db.as(ROLES.kernel), MERCHANT_A, { executor });
+      const decision = await authorize(kernel, {
+        signedIntent: makeSignedIntent({ agent, mandateId, quote }),
+        signedQuote: quote,
+      });
+      expect(decision.verdict).toBe("ALLOW");
+
+      const order = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
+        const r = await client.query<{ state: string; rzp_order_id: string | null }>(
+          `SELECT state, rzp_order_id FROM orders WHERE intent_id = $1`, [decision.intent_id]);
+        return r.rows[0];
+      });
+
+      // The row exists even though the call never returned. Without it the reaper would
+      // conclude no call was made, and release a hold for money that may have moved.
+      expect(order).toBeDefined();
+      expect(order!.state).toBe("AMBIGUOUS");
+      expect(order!.rzp_order_id).toBeNull();
+
+      // The reaper leaves it alone: an order row exists, so the reconciler owns it.
+      const reaped = await releaseStaleReservations(
+        db.as(ROLES.kernel),
+        MERCHANT_A,
+        new Date(Date.now() + 30 * 60_000),
+      );
+      expect(reaped.details).not.toContain(`rsv_${decision.intent_id}`);
+
+      const reservation = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
+        const r = await client.query<{ state: string }>(
+          `SELECT state FROM reservations WHERE intent_id = $1`, [decision.intent_id]);
+        return r.rows[0]?.state;
+      });
+      expect(reservation).toBe("held");
+    } finally {
+      await new Promise<void>((resolve) => blackHole.close(() => resolve()));
+    }
+  });
+
+  it("resolves a stale SUBMITTING row by re-issuing the idempotent create", async () => {
+    const rail = await startTestRail(db.as(ROLES.kernel));
+    try {
+      // A process that died between committing the row and hearing back.
+      await db.superuser.query(
+        `INSERT INTO reservations (reservation_id, mandate_id, merchant_id, intent_id,
+           amount_paise, state) VALUES ($1, $2, $3, $4, 32000, 'held')`,
+        ["rsv_stuck", mandateId, MERCHANT_A, "int_stuck"],
+      );
+      await db.superuser.query(
+        `INSERT INTO orders (order_id, intent_id, mandate_id, merchant_id, amount_paise,
+           state, idempotency_key)
+         VALUES ('ord_stuck', 'int_stuck', $1, $2, 32000, 'SUBMITTING', $3)`,
+        [mandateId, MERCHANT_A, "b".repeat(64)],
+      );
+
+      const railClient = createHttpRail({
+        mode: "replay", baseUrl: rail.replay.url, keyId: "k", keySecret: "s", timeoutMs: 2_000,
+      });
+
+      const result = await reconcileAmbiguous(
+        db.as(ROLES.kernel), railClient, MERCHANT_A, new Date(), rail.executor,
+      );
+      expect(result.examined).toBeGreaterThan(0);
+
+      // Exactly one order reached the rail for this intent: the re-issue collapsed into
+      // it rather than creating a second.
+      const railOrders = [...rail.replay.orders.values()].filter(
+        (o) => o.notes.intent_id === "int_stuck",
+      );
+      expect(railOrders).toHaveLength(1);
+
+      const state = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
+        const r = await client.query<{ state: string }>(
+          `SELECT state FROM orders WHERE intent_id = 'int_stuck'`);
+        return r.rows[0]?.state;
+      });
+      expect(state).not.toBe("SUBMITTING");
+    } finally {
+      await rail.close();
+    }
   });
 });

@@ -30,19 +30,22 @@ export async function migrationFiles(): Promise<string[]> {
 export async function migrate(
   client: Client,
   passwords: Partial<Record<RoleName, string>> = {},
+  skipSchema = false,
 ): Promise<string[]> {
   const files = await migrationFiles();
 
-  await client.query("BEGIN");
-  try {
-    for (const file of files) {
-      const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
-      await client.query(sql);
+  if (!skipSchema) {
+    await client.query("BEGIN");
+    try {
+      for (const file of files) {
+        const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+        await client.query(sql);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
     }
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
   }
 
   for (const role of ALL_ROLES) {

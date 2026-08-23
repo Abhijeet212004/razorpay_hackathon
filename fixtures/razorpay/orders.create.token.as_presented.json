@@ -1,0 +1,36 @@
+{
+  "recorded_at": "2026-08-24T00:00:00Z",
+  "note": "Recurring token order with frequency as_presented. Confirms variable-amount charge-on-demand is available on the test account.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/orders",
+    "body": {
+      "amount": 100,
+      "currency": "INR",
+      "method": "upi",
+      "customer_id": "cust_TTEw8l50tbC4iN",
+      "token": {
+        "max_amount": 5000,
+        "frequency": "as_presented",
+        "expire_at": 1790000000
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "amount": 100,
+      "amount_due": 100,
+      "amount_paid": 0,
+      "attempts": 0,
+      "created_at": 1787494649,
+      "currency": "INR",
+      "entity": "order",
+      "id": "order_TTF0v19n5BvJur",
+      "notes": [],
+      "offer_id": null,
+      "receipt": null,
+      "status": "created"
+    }
+  }
+}

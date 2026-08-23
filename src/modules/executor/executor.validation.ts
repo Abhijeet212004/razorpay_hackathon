@@ -2,6 +2,8 @@ import type { Paise } from "../../shared/money.js";
 
 export type OrderState =
   | "AUTHORISED"
+  /** The row exists and the outbound call has not returned. May or may not have landed. */
+  | "SUBMITTING"
   | "SUBMITTED"
   | "CAPTURED"
   | "FAILED"

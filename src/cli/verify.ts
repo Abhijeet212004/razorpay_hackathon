@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool } from "../shared/db/pg.js";
 import { ROLES } from "../shared/db/roles.js";
 import { setMerchantContext } from "../shared/db/merchant-context.js";
 import { listChainIds } from "../modules/ledger/ledger.repository.js";
