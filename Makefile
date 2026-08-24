@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack
+.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*?## .+$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -58,6 +58,9 @@ seed-check: ## Assert the seed is present and idempotent
 	          ' decisions=' || (SELECT count(*) FROM ledger WHERE kind='DECISION') || \
 	          ' orders=' || (SELECT count(*) FROM orders) || \
 	          ' chains=' || (SELECT count(DISTINCT chain_id) FROM ledger)"
+
+demo: ## The four scenarios, end to end against the running stack
+	@node scripts/demo.mjs
 
 prove: ## Delete each control, show the suite catching it, restore
 	@node scripts/prove.mjs

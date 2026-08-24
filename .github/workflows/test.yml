@@ -2,6 +2,10 @@ name: test
 
 on: [push, pull_request]
 
+env:
+  # Ryuk fails intermittently on hosted runners. Teardown stops containers explicitly.
+  TESTCONTAINERS_RYUK_DISABLED: "true"
+
 jobs:
   suite:
     runs-on: ubuntu-24.04
@@ -14,15 +18,57 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm test
+      # Fails if any invariant has an enforcement point and no test.
       - run: node scripts/invariants.mjs
+
+  # Nine out of ten is broken. A concurrency control that holds most of the time is not a
+  # concurrency control.
+  concurrency-ten-times:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci
+      - name: fifty concurrent intents, ten times
+        run: |
+          for i in $(seq 1 10); do
+            echo "--- run $i ---"
+            npx vitest run tests/security/concurrency.test.ts || exit 1
+          done
+
+  # Proves the tests are load-bearing: each control is deleted, only the test that exists
+  # to catch it is re-run, and the job fails if any of them stays green.
+  controls-are-load-bearing:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci
+      - run: node scripts/prove.mjs
 
   # INV-22: replay mode runs end to end with zero external credentials. This job has no
   # secrets configured, which is the point.
   replay-no-credentials:
     runs-on: ubuntu-24.04
+    env:
+      # Build locally rather than pulling: this workflow must pass before the image
+      # workflow has ever published anything.
+      AGENTKIT_IMAGE: agentkit:ci
     steps:
       - uses: actions/checkout@v4
+      - run: docker compose build
       - run: docker compose up -d --wait
       - run: make seed-check
       - run: make creds
-      - run: docker compose down -v
+      - run: make demo
+      - run: docker compose exec -T kernel node dist/cli/verify.js --merchant mch_sharma_kirana
+      - if: always()
+        run: docker compose logs --tail 40
+      - if: always()
+        run: docker compose down -v

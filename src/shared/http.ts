@@ -46,7 +46,7 @@ function match(routePath: string, actual: string): Record<string, string> | null
 }
 
 export function createHttpService(routes: readonly Route[]): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let rawBody = "";
     req.on("data", (chunk) => (rawBody += chunk));
     req.on("end", () => {
@@ -90,6 +90,15 @@ export function createHttpService(routes: readonly Route[]): Server {
       })();
     });
   });
+
+  // Node closes idle keep-alive sockets after 5s by default, which races any client that
+  // pauses between calls: it reuses a socket the server has just closed and sees the
+  // connection drop rather than a response. Longer than any sensible proxy, and
+  // headersTimeout must exceed it or the server closes first anyway.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+
+  return server;
 }
 
 export function listen(server: Server, port: number, name: string): Promise<void> {
