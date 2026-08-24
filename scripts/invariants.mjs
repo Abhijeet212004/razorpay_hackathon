@@ -7,16 +7,21 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-const ROOTS = ["src", "migrations", "tests"];
+// .github is included because two invariants are enforced by CI rather than by code.
+const ROOTS = ["src", "migrations", "tests", ".github", "docker-compose.yml"];
 const MARKER = /INV-(\d{2})\b/g;
 const SKIP = new Set(["node_modules", ".git", "dist", "coverage"]);
 
 async function* walk(dir) {
+  if (dir.endsWith(".yml")) {
+    yield dir;
+    return;
+  }
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     if (SKIP.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) yield* walk(full);
-    else if (/\.(ts|sql|mjs)$/.test(entry.name)) yield full;
+    else if (/\.(ts|sql|mjs|yml)$/.test(entry.name)) yield full;
   }
 }
 
@@ -28,7 +33,11 @@ for (const root of ROOTS) {
     lines.forEach((line, index) => {
       for (const match of line.matchAll(MARKER)) {
         const id = `INV-${match[1]}`;
-        const site = { file, line: index + 1, test: file.startsWith("tests/") };
+        const site = {
+          file,
+          line: index + 1,
+          test: file.startsWith("tests/") || file.includes("workflows"),
+        };
         found.set(id, [...(found.get(id) ?? []), site]);
       }
     });

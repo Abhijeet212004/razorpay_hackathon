@@ -242,3 +242,101 @@ export async function updateChainHead(
     [mandateId, seq, hash],
   );
 }
+
+export interface NewChallenge {
+  challengeId: string;
+  intentId: string;
+  mandateId: string;
+  merchantId: string;
+  amountPaise: Paise;
+  expiresAt: Date;
+}
+
+/**
+ * The single-use challenge a step-up is approved against. Its TTL is shorter than the
+ * quote's, so an approval can never arrive against a price that has already expired.
+ */
+export async function insertChallenge(
+  client: PoolClient,
+  challenge: NewChallenge,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO challenges (challenge_id, intent_id, mandate_id, merchant_id,
+       amount_paise, state, expires_at)
+     VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+    [
+      challenge.challengeId,
+      challenge.intentId,
+      challenge.mandateId,
+      challenge.merchantId,
+      challenge.amountPaise.toString(),
+      challenge.expiresAt.toISOString(),
+    ],
+  );
+}
+
+export interface PendingChallenge {
+  challengeId: string;
+  intentId: string;
+  mandateId: string;
+  merchantId: string;
+  amountPaise: Paise;
+  state: string;
+  expiresAt: Date;
+}
+
+export async function findChallenge(
+  client: PoolClient,
+  challengeId: string,
+): Promise<PendingChallenge | null> {
+  const result = await client.query<{
+    challenge_id: string;
+    intent_id: string;
+    mandate_id: string;
+    merchant_id: string;
+    amount_paise: string;
+    state: string;
+    expires_at: Date;
+  }>(
+    `SELECT challenge_id, intent_id, mandate_id, merchant_id, amount_paise::text,
+            state, expires_at
+       FROM challenges WHERE challenge_id = $1`,
+    [challengeId],
+  );
+  const row = result.rows[0];
+  return row === undefined
+    ? null
+    : {
+        challengeId: row.challenge_id,
+        intentId: row.intent_id,
+        mandateId: row.mandate_id,
+        merchantId: row.merchant_id,
+        amountPaise: BigInt(row.amount_paise),
+        state: row.state,
+        expiresAt: row.expires_at,
+      };
+}
+
+export async function resolveChallenge(
+  client: PoolClient,
+  challengeId: string,
+  state: "approved" | "rejected",
+): Promise<boolean> {
+  const result = await client.query(
+    `UPDATE challenges SET state = $2, resolved_at = now()
+      WHERE challenge_id = $1 AND state = 'pending'`,
+    [challengeId, state],
+  );
+  return result.rowCount === 1;
+}
+
+export async function reservationState(
+  client: PoolClient,
+  intentId: string,
+): Promise<string | null> {
+  const result = await client.query<{ state: string }>(
+    `SELECT state FROM reservations WHERE intent_id = $1`,
+    [intentId],
+  );
+  return result.rows[0]?.state ?? null;
+}

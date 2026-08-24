@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { Clock } from "../../shared/clock.js";
+import { setMerchantContext } from "../../shared/db/merchant-context.js";
 import { errorClass, silentLogger, type Logger } from "../../shared/logger.js";
 import type { JsonValue } from "../../shared/crypto/jcs.js";
 import { withMandateLockHeld } from "../../shared/egress-guard.js";
@@ -403,6 +404,19 @@ async function runLocked(
       });
     }
 
+    let challengeId: string | null = null;
+    if (outcome.verdict === "STEP_UP") {
+      challengeId = `chl_${randomUUID()}`;
+      await repo.insertChallenge(client, {
+        challengeId,
+        intentId: intent.intent_id,
+        mandateId: mandate.mandateId,
+        merchantId: intent.merchant_id,
+        amountPaise: intent.amount_paise,
+        expiresAt: new Date(now.getTime() + ctx.config.challengeTtlMs),
+      });
+    }
+
     const decisionId = `dec_${randomUUID()}`;
 
     await append(client, {
@@ -470,9 +484,152 @@ async function runLocked(
       reservation_id: reservationId,
       idempotency_key:
         outcome.verdict === "ALLOW" ? idempotencyKey(intent.intent_id) : null,
-      challenge_id: null,
+      challenge_id: challengeId,
       ledger_seq: decisionEntry.seq,
       decided_at: now.toISOString(),
     };
   });
+}
+
+export class UnknownChallengeError extends Error {
+  constructor(readonly challengeId: string) {
+    super(`no challenge ${challengeId} is visible to this merchant`);
+    this.name = "UnknownChallengeError";
+  }
+}
+
+/**
+ * Step-up approval. Deliberately NOT a re-entry into the sequence above.
+ *
+ * The first pass already burned the nonce and consumed the quote, so re-running it would
+ * deny on its own side effects. This is a narrow locked transaction that re-checks only
+ * what could have changed while a human was deciding: the mandate could have been
+ * revoked, the challenge could have expired, the hold could have been reaped.
+ *
+ * No second verifier call, no re-quote, no new nonce.
+ */
+export async function approveStepUp(
+  ctx: KernelContext,
+  challengeId: string,
+  approve = true,
+): Promise<Decision> {
+  const now = ctx.clock.now();
+
+  const decision = await withAuthorizationTransaction(
+    ctx.pool,
+    {
+      merchantId: ctx.config.merchantId,
+      lockTimeoutMs: ctx.config.lockTimeoutMs,
+      statementTimeoutMs: ctx.config.statementTimeoutMs,
+      retryAttempts: ctx.config.retryAttempts,
+      retryBackoffMs: ctx.config.retryBackoffMs,
+    },
+    async (client): Promise<Decision> => {
+      const challenge = await repo.findChallenge(client, challengeId);
+      if (challenge === null) throw new UnknownChallengeError(challengeId);
+
+      const mandate = await repo.lockMandate(client, challenge.mandateId);
+      if (mandate === null) throw new UnknownMandateError(challenge.mandateId);
+
+      return withMandateLockHeld(mandate.mandateId, async () => {
+        const reasonCode = await checkApproval(client, challenge, mandate, now, approve);
+        const verdict = reasonCode === "OK-000" ? "ALLOW" : "DENY";
+
+        await repo.resolveChallenge(
+          client,
+          challengeId,
+          verdict === "ALLOW" ? "approved" : "rejected",
+        );
+
+        if (verdict !== "ALLOW") {
+          // The hold was only ever a placeholder for a purchase awaiting a human.
+          await client.query(
+            `UPDATE reservations
+                SET state = 'released', resolved_at = now(),
+                    release_reason = 'step_up_abandoned'
+              WHERE intent_id = $1 AND state = 'held'`,
+            [challenge.intentId],
+          );
+        }
+
+        const decisionId = `dec_${randomUUID()}`;
+        const entry = await append(client, {
+          chainId: mandate.mandateId,
+          kind: "DECISION",
+          merchantId: mandate.merchantId,
+          ref: challenge.intentId,
+          payloadRedacted: {
+            decision_id: decisionId,
+            intent_id: challenge.intentId,
+            verdict,
+            reason_code: reasonCode,
+            step_up: { challenge_id: challengeId, satisfied: verdict === "ALLOW" },
+          },
+        });
+        await repo.updateChainHead(client, mandate.mandateId, entry.seq, entry.hash);
+
+        return {
+          decision_id: decisionId,
+          intent_id: challenge.intentId,
+          mandate_id: mandate.mandateId,
+          verdict,
+          reason_code: reasonCode,
+          evaluated: [],
+          reservation_id: null,
+          idempotency_key: verdict === "ALLOW" ? idempotencyKey(challenge.intentId) : null,
+          challenge_id: challengeId,
+          ledger_seq: entry.seq,
+          decided_at: now.toISOString(),
+        };
+      });
+    },
+  );
+
+  if (decision.verdict === "ALLOW") {
+    const amount = await amountForIntent(ctx, decision.intent_id);
+    if (amount !== null) await settle(ctx, decision, amount);
+  }
+
+  return decision;
+}
+
+/** Re-checks only what a human could have outlasted. First reason wins, as elsewhere. */
+async function checkApproval(
+  client: PoolClient,
+  challenge: repo.PendingChallenge,
+  mandate: repo.LockedMandate,
+  now: Date,
+  approve: boolean,
+): Promise<ReasonCode> {
+  if (!approve) return "STP-001";
+  if (challenge.state !== "pending") return "INT-002";
+  if (now >= challenge.expiresAt) return "INT-002";
+  if (mandate.state === "revoked") return "MND-003";
+  if (mandate.state !== "live" || now >= mandate.notAfter) return "MND-002";
+
+  const reservation = await repo.reservationState(client, challenge.intentId);
+  // Reaped or released while the human was deciding. Authorising now would spend against
+  // a cap that no longer counts it.
+  if (reservation !== "held") return "INT-002";
+
+  return "OK-000";
+}
+
+async function amountForIntent(ctx: KernelContext, intentId: string): Promise<bigint | null> {
+  const client = await ctx.pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setMerchantContext(client, ctx.config.merchantId);
+    const result = await client.query<{ amount_paise: string }>(
+      `SELECT amount_paise::text FROM reservations WHERE intent_id = $1`,
+      [intentId],
+    );
+    await client.query("COMMIT");
+    return result.rows[0] === undefined ? null : BigInt(result.rows[0].amount_paise);
+  } catch {
+    await client.query("ROLLBACK").catch(() => undefined);
+    return null;
+  } finally {
+    client.release();
+  }
 }

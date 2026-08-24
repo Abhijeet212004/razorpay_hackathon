@@ -4,6 +4,7 @@ import { expireChallenges, expireMandates } from "../../modules/jobs/expire.job.
 import { reconcileAmbiguous } from "../../modules/jobs/reconcile-ambiguous.job.js";
 import { releaseStaleReservations } from "../../modules/jobs/release-stale.job.js";
 import { verifyAndAnchor } from "../../modules/jobs/verify-anchor.job.js";
+import { refreshOperatorMetrics } from "../../modules/console/operator.js";
 import { JOB_TIMINGS } from "../../modules/jobs/jobs.validation.js";
 import { createHttpRail } from "../../modules/rail/rail.http.js";
 import { assertNoPaymentCredential } from "../../shared/credentials.js";
@@ -77,6 +78,15 @@ every(JOB_TIMINGS.anchorIntervalMs, "verify-chain-anchor", async () => {
     consoleLogger.count("worker.chain.broken");
   }
   return result;
+});
+
+// The operator console reads only what this writes: counts and sums, per merchant,
+// each computed inside that merchant's own row level security context.
+every(60_000, "operator-metrics", async () => {
+  // As the worker: only it may write operator_metrics. The kernel serves public HTTP and
+  // has no business producing the one table that is read across merchants.
+  const written = await refreshOperatorMetrics(pool, [merchant]);
+  return { changed: written };
 });
 
 const server = createHttpService([

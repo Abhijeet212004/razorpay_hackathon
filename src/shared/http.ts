@@ -67,11 +67,14 @@ export function createHttpService(routes: readonly Route[]): Server {
               headers: req.headers,
               rawBody,
             });
+            // A string body is already the payload — an HTML page must not be handed
+            // back JSON-encoded, quotes and all.
+            const isText = typeof result.body === "string";
             res.writeHead(result.status, {
-              "Content-Type": "application/json",
+              "Content-Type": isText ? "text/html; charset=utf-8" : "application/json",
               ...(result.headers ?? {}),
             });
-            res.end(JSON.stringify(result.body));
+            res.end(isText ? (result.body as string) : JSON.stringify(result.body));
           } catch (error) {
             // The message never crosses the boundary: it can carry internal detail, and
             // a caller has no use for it.

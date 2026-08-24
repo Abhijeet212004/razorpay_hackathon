@@ -1,5 +1,5 @@
-# docker compose up, on a machine with no accounts and no keys, reaches a seeded working
-# system. RAIL=replay is the default and needs no credentials at all.
+# INV-22: docker compose up, on a machine with no accounts and no keys, reaches a seeded
+# working system. RAIL=replay is the default and needs no credentials at all.
 #
 # Every dependency is health-gated. Most "it didn't work" is a race on Postgres.
 
