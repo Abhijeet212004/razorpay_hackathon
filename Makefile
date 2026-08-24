@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo
+.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo image-check
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*?## .+$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -67,6 +67,9 @@ prove: ## Delete each control, show the suite catching it, restore
 
 attack: ## The red-team suite: a hostile agent, no model required
 	@TESTCONTAINERS_RYUK_DISABLED=true npx vitest run tests/redteam
+
+image-check: ## Confirm a stranger can pull the published image, on both architectures
+	@bash scripts/check-image.sh
 
 judge: ## Everything a reviewer needs, in one command
 	$(MAKE) up
