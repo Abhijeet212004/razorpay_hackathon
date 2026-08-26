@@ -99,6 +99,12 @@ export async function priceLines(
   }));
 }
 
+export interface QuoteLine {
+  sku: string;
+  quantity: number;
+  pricePaise: Paise;
+}
+
 export interface NewQuote {
   quoteId: string;
   mandateId: string;
@@ -111,14 +117,15 @@ export interface NewQuote {
   expiresAt: Date;
   kid: string;
   signature: Buffer;
+  basket: readonly QuoteLine[];
 }
 
 export async function insert(client: PoolClient, quote: NewQuote): Promise<void> {
   await client.query(
     `INSERT INTO quotes (
        quote_id, mandate_id, merchant_id, basket_hash, amount_paise, categories,
-       nonce, issued_at, expires_at, kid, signature
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+       nonce, issued_at, expires_at, kid, signature, basket
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
     [
       quote.quoteId,
       quote.mandateId,
@@ -131,8 +138,27 @@ export async function insert(client: PoolClient, quote: NewQuote): Promise<void>
       quote.expiresAt.toISOString(),
       quote.kid,
       quote.signature,
+      JSON.stringify(
+        quote.basket.map((line) => ({
+          sku: line.sku,
+          quantity: line.quantity,
+          price_paise: line.pricePaise.toString(),
+        })),
+      ),
     ],
   );
+}
+
+/** What a past quote priced, so a reorder reprices the same items. */
+export async function basketFor(
+  client: PoolClient,
+  intentId: string,
+): Promise<Array<{ sku: string; quantity: number }>> {
+  const result = await client.query<{ basket: Array<{ sku: string; quantity: number }> }>(
+    `SELECT basket FROM quotes WHERE consumed_by = $1`,
+    [intentId],
+  );
+  return result.rows[0]?.basket ?? [];
 }
 
 export interface MandateScopeRow {

@@ -61,7 +61,11 @@ function page(title: string, body: string): string {
 <body><main>${body}</main></body></html>`;
 }
 
-export function consentPage(view: ConsentRequestView, demoCode?: string): string {
+export function consentPage(
+  view: ConsentRequestView,
+  demoCode?: string,
+  returnTo?: string,
+): string {
   const body = `
     <h1>Let ${escape(view.agentName)} shop for you?</h1>
     <p class="sub">at ${escape(view.merchantName)}</p>
@@ -81,7 +85,9 @@ export function consentPage(view: ConsentRequestView, demoCode?: string): string
 
     ${demoCode === undefined ? "" : `<div class="demo">Demo number — your code is <code>${escape(demoCode)}</code></div>`}
 
-    <form method="POST" action="/consent/${escape(view.requestRef)}/verify">
+    <form method="POST" action="/consent/${escape(view.requestRef)}/verify${
+      returnTo === undefined ? "" : `?return=${encodeURIComponent(returnTo)}`
+    }">
       <input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
              placeholder="000000" autocomplete="one-time-code" required>
       <button type="submit">Allow</button>
@@ -128,11 +134,19 @@ export function stepUpPage(view: StepUpView): string {
   return page("Approve purchase", body);
 }
 
-export function resultPage(title: string, message: string, detail?: string): string {
+export function resultPage(
+  title: string,
+  message: string,
+  detail?: string,
+  returnTo?: string,
+): string {
   return page(
     title,
     `<h1>${escape(title)}</h1><p class="sub">${escape(message)}</p>
-     ${detail === undefined ? "" : `<div class="card"><div class="row"><span class="k">Reference</span><span class="v">${escape(detail)}</span></div></div>`}`,
+     ${detail === undefined ? "" : `<div class="card"><div class="row"><span class="k">Reference</span><span class="v">${escape(detail)}</span></div></div>`}
+     ${returnTo === undefined ? "" : `<form method="GET" action="${escape(returnTo)}">
+       ${detail === undefined ? "" : `<input type="hidden" name="mandate" value="${escape(detail)}">`}
+       <button type="submit">Back to the shop</button></form>`}`,
   );
 }
 

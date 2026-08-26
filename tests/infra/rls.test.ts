@@ -117,10 +117,10 @@ describe("row level security with FORCE", () => {
         ORDER BY relname`,
       [["ledger", "mandates", "reservations", "quotes", "orders", "webhook_events",
         "merchants", "catalog_items", "challenges", "refunds", "rate_limit_buckets",
-        "consent_requests"]],
+        "consent_requests", "mcp_sessions"]],
     );
 
-    expect(result.rows).toHaveLength(12);
+    expect(result.rows).toHaveLength(13);
     for (const row of result.rows) {
       expect(row.relrowsecurity, `${row.relname} must ENABLE row level security`).toBe(true);
       expect(row.relforcerowsecurity, `${row.relname} must FORCE row level security`).toBe(true);

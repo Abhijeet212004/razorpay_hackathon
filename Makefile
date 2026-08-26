@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo image-check
+.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo image-check agent mcp
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*?## .+$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -61,6 +61,12 @@ seed-check: ## Assert the seed is present and idempotent
 
 demo: ## The four scenarios, end to end against the running stack
 	@node scripts/demo.mjs
+
+mcp: ## Drive the MCP endpoint the way Claude Desktop would
+	@node scripts/mcp-client.mjs
+
+agent: ## An agent the merchant did not write, discovering and transacting from scratch
+	@node scripts/external-agent.mjs
 
 prove: ## Delete each control, show the suite catching it, restore
 	@node scripts/prove.mjs

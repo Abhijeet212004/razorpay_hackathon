@@ -289,3 +289,38 @@ export async function verifyAndGrant(
 
   return { kind: "GRANTED", mandateId };
 }
+
+export interface ConsentStatus {
+  readonly state: string;
+  readonly mandateId: string | null;
+}
+
+/**
+ * The outcome of a grant, for the agent that asked for it.
+ *
+ * An agent must not have to read the human's screen to find out whether it was permitted.
+ * It learns exactly two things: whether a decision has been made, and the mandate id if
+ * one was granted. Never the contact, never the OTP, never how many attempts were left.
+ */
+export async function consentStatus(
+  pool: Pool,
+  options: ConsentOptions,
+  requestRef: string,
+): Promise<ConsentStatus | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setMerchantContext(client, options.merchantId);
+    const result = await client.query<{ state: string; mandate_id: string | null }>(
+      `SELECT state, mandate_id FROM consent_requests WHERE request_ref = $1`,
+      [requestRef],
+    );
+    await client.query("COMMIT");
+    const row = result.rows[0];
+    return row === undefined
+      ? null
+      : { state: row.state, mandateId: row.mandate_id };
+  } finally {
+    client.release();
+  }
+}

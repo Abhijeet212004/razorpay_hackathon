@@ -138,6 +138,12 @@ export async function priceBasket(
       expiresAt,
       kid: activeKey.kid,
       signature,
+      // What was priced, in the merchant's own numbers.
+      basket: lines.map((line) => ({
+        sku: line.sku,
+        quantity: line.quantity,
+        pricePaise: line.pricePaise,
+      })),
     });
 
     await client.query("COMMIT");

@@ -26,6 +26,8 @@ x-mode-env: &mode-env
   BRAIN: ${BRAIN:-scripted}
   VERIFIER: ${VERIFIER:-scripted}
   MERCHANT_ID: ${MERCHANT_ID:-mch_sharma_kirana}
+  # The merchant's existing product endpoint. This is the entire integration.
+  CATALOG_URL: ${CATALOG_URL:-http://storefront:4000/api/v1/products/all}
   WEBHOOK_SECRET: ${WEBHOOK_SECRET:-whsec_replay_dev_only}
   EXECUTOR_URL: http://executor:8081
   EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:-executor-dev-token}
@@ -187,6 +189,65 @@ services:
       retries: 20
       start_period: 3s
 
+  # The merchant's own database. MongoDB, which the trust kernel cannot use and never
+  # touches — the clearest possible statement that we do not ask a merchant to change
+  # their stack.
+  mongo:
+    image: mongo:7.0.16@sha256:c630c59342c1493d50345136df2af14a76b9e827dd5316bfabee07a0880a5f3a
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # Runs once. The merchant's own product data, in the merchant's own database.
+  storefront-seed:
+    image: mongo:7.0.16
+    volumes:
+      - ./storefront/seed:/seed:ro
+    command: ["mongosh", "mongodb://mongo:27017/sharma_kirana", "--quiet", "--file", "/seed/products.js"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+
+  # Sharma Kirana's shop. An ordinary MERN storefront: catalog, cart, human checkout.
+  # The only thing we added is a route.
+  storefront:
+    image: ${STOREFRONT_IMAGE:-agentkit-storefront:local}
+    build:
+      context: ./storefront
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      MONGO_URI: mongodb://mongo:27017/sharma_kirana
+      JWT_SECRET: ${JWT_SECRET:-storefront-dev-secret}
+      # The human lane. Blank is fine — checkout returns 503 rather than crashing.
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      JWT_EXPIRE: "7d"
+      COOKIE_EXPIRE: "7"
+      KERNEL_URL: http://kernel:8080
+      PUBLIC_KERNEL_URL: ${PUBLIC_KERNEL_URL:-http://localhost:58080}
+    ports:
+      - "58090:4000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      storefront-seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/api/v1/products/all || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
 volumes:
   # Named, never a host bind-mount: bind-mounted Postgres data breaks on Windows.
   pgdata:
+  mongodata:

@@ -5,6 +5,7 @@ import { reconcileAmbiguous } from "../../modules/jobs/reconcile-ambiguous.job.j
 import { releaseStaleReservations } from "../../modules/jobs/release-stale.job.js";
 import { verifyAndAnchor } from "../../modules/jobs/verify-anchor.job.js";
 import { refreshOperatorMetrics } from "../../modules/console/operator.js";
+import { syncCatalog } from "../../modules/jobs/catalog-sync.job.js";
 import { JOB_TIMINGS } from "../../modules/jobs/jobs.validation.js";
 import { createHttpRail } from "../../modules/rail/rail.http.js";
 import { assertNoPaymentCredential } from "../../shared/credentials.js";
@@ -79,6 +80,24 @@ every(JOB_TIMINGS.anchorIntervalMs, "verify-chain-anchor", async () => {
   }
   return result;
 });
+
+// The merchant's own product endpoint, pulled into our priced catalog. This is also
+// where injected product text is caught and quarantined.
+const catalogUrl = process.env.CATALOG_URL;
+if (catalogUrl !== undefined) {
+  every(30_000, "catalog-sync", async () => {
+    // As the worker: the kernel prices from this table and may not write it.
+    const result = await syncCatalog(pool, {
+      merchantId: merchant,
+      catalogUrl,
+      logger: consoleLogger,
+    });
+    if (result.quarantined.length > 0) {
+      console.log(`[agentkit] quarantined ${result.quarantined.length} product(s)`);
+    }
+    return { changed: result.quarantined.length };
+  });
+}
 
 // The operator console reads only what this writes: counts and sums, per merchant,
 // each computed inside that merchant's own row level security context.
