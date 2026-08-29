@@ -31,6 +31,8 @@ import { toolsFor } from "./mcp.tools.js";
 export interface McpOptions {
   readonly merchantId: string;
   readonly publicBaseUrl: string;
+  /** Where the merchant identifies the shopper before they approve. See RuntimeConfig. */
+  readonly merchantAuthorizeUrl?: string | null;
   /** Which classes this merchant has chosen to expose. Money can be withheld entirely. */
   readonly exposed: readonly ToolClass[];
   readonly consent: ConsentOptions;
@@ -141,7 +143,10 @@ export async function callTool(
 
         return text({
           request_ref: consent.requestRef,
-          consent_url: `${options.publicBaseUrl}/consent/${consent.requestRef}`,
+          consent_url:
+            options.merchantAuthorizeUrl == null
+              ? `${options.publicBaseUrl}/consent/${consent.requestRef}`
+              : `${options.merchantAuthorizeUrl}?ref=${encodeURIComponent(consent.requestRef)}`,
           granted: false,
           next: "Show consent_url to the shopper, then poll check_permission.",
         });

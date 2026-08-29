@@ -10,6 +10,10 @@ export const PAYMENT_CREDENTIAL_ENV_VARS = [
   "RZP_KEY_ID",
   "RAZORPAY_KEY_SECRET",
   "RAZORPAY_KEY_ID",
+  // Razorpay has no read-only key. A "read" credential here would be the same credential
+  // that can charge, so the name is not an exemption.
+  "RZP_READ_KEY_SECRET",
+  "RZP_READ_KEY_ID",
 ] as const;
 
 export class PaymentCredentialPresentError extends Error {

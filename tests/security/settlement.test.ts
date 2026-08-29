@@ -5,6 +5,7 @@ import { authorize } from "../../src/modules/authorization/authorization.service
 import { ingestWebhook } from "../../src/modules/reconciler/reconciler.service.js";
 import { releaseStaleReservations } from "../../src/modules/jobs/release-stale.job.js";
 import { reconcileAmbiguous } from "../../src/modules/jobs/reconcile-ambiguous.job.js";
+import { JOB_TIMINGS } from "../../src/modules/jobs/jobs.validation.js";
 import { createHttpRail } from "../../src/modules/rail/rail.http.js";
 import { createExecutor } from "../../src/modules/executor/executor.service.js";
 import { ROLES } from "../../src/shared/db/roles.js";
@@ -481,10 +482,21 @@ describe("a timeout is not a call that never happened", () => {
     }
   });
 
-  it("resolves a stale SUBMITTING row by re-issuing the idempotent create", async () => {
+  it("adopts an order the rail already has instead of creating a second", async () => {
     const rail = await startTestRail(db.as(ROLES.kernel));
     try {
-      // A process that died between committing the row and hearing back.
+      // The lost-answer case: the call landed, the order exists on the rail, and the
+      // process died before the id could be stored.
+      const created = await fetch(`${rail.replay.url}/v1/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: 32000,
+          currency: "INR",
+          notes: { intent_id: "int_stuck" },
+        }),
+      }).then((r) => r.json() as Promise<{ id: string }>);
+
       await db.superuser.query(
         `INSERT INTO reservations (reservation_id, mandate_id, merchant_id, intent_id,
            amount_paise, state) VALUES ($1, $2, $3, $4, 32000, 'held')`,
@@ -501,24 +513,68 @@ describe("a timeout is not a call that never happened", () => {
         mode: "replay", baseUrl: rail.replay.url, keyId: "k", keySecret: "s", timeoutMs: 2_000,
       });
 
-      const result = await reconcileAmbiguous(
-        db.as(ROLES.kernel), railClient, MERCHANT_A, new Date(), rail.executor,
-      );
+      const result = await reconcileAmbiguous(db.as(ROLES.kernel), railClient, MERCHANT_A);
       expect(result.examined).toBeGreaterThan(0);
 
-      // Exactly one order reached the rail for this intent: the re-issue collapsed into
-      // it rather than creating a second.
+      // The whole point: still one order for this intent. The rail does not dedupe, so
+      // anything that issued a create here would have left a second, payable order.
       const railOrders = [...rail.replay.orders.values()].filter(
         (o) => o.notes.intent_id === "int_stuck",
       );
       expect(railOrders).toHaveLength(1);
 
-      const state = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
+      // And the row now points at the order that already existed, so a webhook naming it
+      // can be attributed.
+      const row = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
+        const r = await client.query<{ state: string; rzp_order_id: string | null }>(
+          `SELECT state, rzp_order_id FROM orders WHERE intent_id = 'int_stuck'`);
+        return r.rows[0];
+      });
+      expect(row?.rzp_order_id).toBe(created.id);
+      expect(row?.state).not.toBe("SUBMITTING");
+    } finally {
+      await rail.close();
+    }
+  });
+
+  it("never creates an order for an intent the rail never saw", async () => {
+    const rail = await startTestRail(db.as(ROLES.kernel));
+    try {
+      await db.superuser.query(
+        `INSERT INTO reservations (reservation_id, mandate_id, merchant_id, intent_id,
+           amount_paise, state) VALUES ($1, $2, $3, $4, 32000, 'held')`,
+        ["rsv_never", mandateId, MERCHANT_A, "int_never"],
+      );
+      await db.superuser.query(
+        `INSERT INTO orders (order_id, intent_id, mandate_id, merchant_id, amount_paise,
+           state, idempotency_key)
+         VALUES ('ord_never', 'int_never', $1, $2, 32000, 'SUBMITTING', $3)`,
+        [mandateId, MERCHANT_A, "c".repeat(64)],
+      );
+
+      const railClient = createHttpRail({
+        mode: "replay", baseUrl: rail.replay.url, keyId: "k", keySecret: "s", timeoutMs: 2_000,
+      });
+
+      // Reconciling is a read. It establishes what happened; it does not go on to make a
+      // purchase the shopper is no longer expecting.
+      await reconcileAmbiguous(db.as(ROLES.kernel), railClient, MERCHANT_A);
+      expect(
+        [...rail.replay.orders.values()].filter((o) => o.notes.intent_id === "int_never"),
+      ).toHaveLength(0);
+
+      // Past the window it is given up on, loudly, and the hold is released so the cap
+      // recovers rather than being pinned forever by an outcome we never established.
+      const later = new Date(Date.now() + JOB_TIMINGS.reconcileMaxAgeMs + 60_000);
+      const result = await reconcileAmbiguous(db.as(ROLES.kernel), railClient, MERCHANT_A, later);
+      expect(result.details.join(",")).toContain("FAILED_UNRESOLVED");
+
+      const reservation = await withMerchantContext(db.as(ROLES.kernel), MERCHANT_A, async (client) => {
         const r = await client.query<{ state: string }>(
-          `SELECT state FROM orders WHERE intent_id = 'int_stuck'`);
+          `SELECT state FROM reservations WHERE intent_id = 'int_never'`);
         return r.rows[0]?.state;
       });
-      expect(state).not.toBe("SUBMITTING");
+      expect(reservation).not.toBe("held");
     } finally {
       await rail.close();
     }

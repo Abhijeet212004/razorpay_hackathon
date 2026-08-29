@@ -32,6 +32,8 @@ export interface LockedMandate {
   allowedMerchants: readonly string[];
   allowedCategories: readonly string[];
   authEventId: string | null;
+  customerRef: string | null;
+  fulfilmentRef: string | null;
   chainHeadSeq: number | null;
   chainHeadHash: Buffer | null;
 }
@@ -70,13 +72,16 @@ export async function lockMandate(
     silent_threshold_paise: string;
     scope: MandateScope;
     auth_event_id: string | null;
+    customer_ref: string | null;
+    fulfilment_ref: string | null;
     chain_head_seq: string | null;
     chain_head_hash: Buffer | null;
   }>(
     `SELECT mandate_id, merchant_id, agent_id, state, not_before, not_after,
             per_transaction_paise::text, cumulative_paise::text,
             cumulative_window::text, velocity_per_hour, silent_threshold_paise::text,
-            scope, auth_event_id, chain_head_seq::text, chain_head_hash
+            scope, auth_event_id, customer_ref, fulfilment_ref,
+            chain_head_seq::text, chain_head_hash
        FROM mandates
       WHERE mandate_id = $1
       FOR UPDATE`,
@@ -101,6 +106,8 @@ export async function lockMandate(
     allowedMerchants: stringArray(row.scope?.merchants),
     allowedCategories: stringArray(row.scope?.categories),
     authEventId: row.auth_event_id,
+    customerRef: row.customer_ref,
+    fulfilmentRef: row.fulfilment_ref,
     chainHeadSeq: row.chain_head_seq === null ? null : Number(row.chain_head_seq),
     chainHeadHash: row.chain_head_hash,
   };

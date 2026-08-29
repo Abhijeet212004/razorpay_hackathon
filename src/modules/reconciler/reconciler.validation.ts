@@ -25,7 +25,12 @@ export const WebhookEnvelopeSchema = z.object({
 export type WebhookEnvelope = z.infer<typeof WebhookEnvelopeSchema>;
 
 export type IngestOutcome =
-  | { readonly kind: "APPLIED"; readonly orderId: string; readonly state: string }
+  | {
+      readonly kind: "APPLIED";
+      readonly orderId: string;
+      readonly intentId: string;
+      readonly state: string;
+    }
   | { readonly kind: "DUPLICATE"; readonly providerEventId: string }
   | { readonly kind: "UNVERIFIED" }
   | { readonly kind: "MALFORMED" }

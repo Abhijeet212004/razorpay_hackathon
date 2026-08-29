@@ -204,15 +204,27 @@ step(9, "Buy again — now it is silent", "under the threshold, no interaction a
 const second = await buy(me, mandateId, [{ sku: found.items[1].sku, quantity: 1 }], "and one more");
 line("verdict", `${verdict(second.decision.verdict)}  ${second.decision.reason_code}`);
 line("amount", rupees(second.quote.amount_paise));
+if (second.decision.approval_url) {
+  // Silence is earned by a settled first order at this merchant. On the live rail nobody
+  // has paid one yet, so STP-002 correctly asks again rather than assuming.
+  line("why not silent", dim("no settled order at this merchant yet — STP-002 still applies"));
+  await fetch(second.decision.approval_url, { method: "POST" });
+  line("approved", ok("a human said yes"));
+}
 await new Promise((r) => setTimeout(r, 2500));
 
 step(10, "Track it", "processing means we do not yet know — never retry it");
-const status = (await call("/agent/orders/status", {
+const tracked = await call("/agent/orders/status", {
   method: "POST",
   body: JSON.stringify({ mandate_id: mandateId, intent_id: second.intent.intent_id }),
-})).body;
-line("state", status.state === "completed" ? ok(status.state) : hm(status.state));
-line("reconciling", String(status.reconciling));
+});
+if (tracked.status === 404) {
+  line("state", hm("no order — the intent was never authorised to become one"));
+} else {
+  const status = tracked.body;
+  line("state", status.state === "completed" ? ok(status.state) : hm(status.state));
+  line("reconciling", String(status.reconciling));
+}
 
 step(11, "Reorder", "the same items, priced afresh — yesterday's approval buys nothing today");
 const again = (await call("/agent/orders/reorder", {

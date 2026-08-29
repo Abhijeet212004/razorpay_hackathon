@@ -1,4 +1,5 @@
 /** INV-09, INV-11, INV-20 — the jobs that resolve every non-terminal state. */
+import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { authorize } from "../../src/modules/authorization/authorization.service.js";
 import { revoke } from "../../src/modules/mandate/mandate.service.js";
@@ -207,5 +208,24 @@ describe("worker jobs", () => {
     const result = await verifyAndAnchor(db.as(ROLES.worker), MERCHANT_A);
     // Repairing tamper evidence is indistinguishable from tampering, so it is reported.
     expect(result.broken).toContain(mandateId);
+  });
+
+  it("tells the merchant when reconciling is what captured the payment", async () => {
+    // The webhook path already does this. Reconciling is the other way an order reaches
+    // CAPTURED — and it is the path taken precisely when the webhook did not arrive, so
+    // a gap here means money settles and the shopper's order exists nowhere.
+    const source = await readFile(
+      new URL("../../src/modules/jobs/reconcile-ambiguous.job.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source).toMatch(/onCaptured/);
+    expect(source).toMatch(/resolved === "CAPTURED" && onCaptured !== undefined/);
+
+    // And the worker, which is what runs it, actually supplies the hook.
+    const worker = await readFile(
+      new URL("../../src/services/worker/main.ts", import.meta.url),
+      "utf8",
+    );
+    expect(worker).toMatch(/reconcileAmbiguous\(.*recordWithMerchant/s);
   });
 });

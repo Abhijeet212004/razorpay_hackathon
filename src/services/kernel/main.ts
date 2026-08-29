@@ -17,7 +17,17 @@ import {
   verifyAndGrant,
 } from "../../modules/consent/consent.service.js";
 import { RequestConsentSchema } from "../../modules/consent/consent.validation.js";
-import { consentPage, resultPage, stepUpPage } from "../../modules/consent/consent.pages.js";
+import { consentPage, instrumentPage, payPage, resultPage, stepUpPage } from "../../modules/consent/consent.pages.js";
+import { bindConsentRefs } from "../../modules/consent/consent.service.js";
+import { verifyAuthorizationToken } from "../../modules/consent/authorization-token.js";
+import { createInstrumentClient } from "../../modules/consent/instrument.client.js";
+import {
+  beginInstrumentSetup,
+  completeInstrumentSetup,
+  readMandateForInstrument,
+  readPayableOrder,
+  bankCeiling,
+} from "../../modules/consent/instrument.service.js";
 import { setMerchantContext } from "../../shared/db/merchant-context.js";
 import * as console_ from "../../modules/console/console.repository.js";
 import * as catalog from "../../modules/catalog/catalog.service.js";
@@ -25,9 +35,11 @@ import { CatalogSearchSchema } from "../../modules/catalog/catalog.validation.js
 import * as orders from "../../modules/orders/orders.service.js";
 import { toolManifest } from "../../modules/agent/agent.tools.js";
 import { handleMcp } from "../../modules/mcp/mcp.controller.js";
+import { callerKey, consume } from "../../modules/ratelimit/ratelimit.service.js";
+import { fulfil } from "../../modules/fulfilment/fulfilment.service.js";
 import type { ToolClass } from "../../modules/agent/agent.tools.js";
 import { ingestWebhook } from "../../modules/reconciler/reconciler.service.js";
-import { createHttpRail } from "../../modules/rail/rail.http.js";
+import { createExecutorReadRail } from "../../modules/rail/rail.proxy.js";
 import { scriptedVerifier } from "../../modules/verifier/verifier.service.js";
 import { assertNoPaymentCredential } from "../../shared/credentials.js";
 import { loadConfig, poolFor } from "../../shared/config.js";
@@ -53,15 +65,25 @@ const executor = createExecutorHttpClient({
   token: config.executorToken,
 });
 
-const rail = createHttpRail({
+// Reads provider truth through the executor. Razorpay has no read-only key, so holding
+// one here to reconcile would mean holding one that can also charge.
+const rail = createExecutorReadRail({
   mode: config.rail,
-  baseUrl: config.railBaseUrl,
-  // The kernel reads order state to reconcile. It cannot create a payment: these are not
-  // a credential, and the rail rejects them for anything that moves money.
-  keyId: process.env.RZP_READ_KEY_ID ?? "rzp_test_replay",
-  keySecret: process.env.RZP_READ_KEY_SECRET ?? "replay-has-no-real-secret",
+  baseUrl: config.executorUrl,
+  token: config.executorToken,
   timeoutMs: 8000,
 });
+
+const instruments = createInstrumentClient({
+  baseUrl: config.executorUrl,
+  token: config.executorToken,
+});
+
+const instrumentDeps = {
+  pool,
+  merchantId: config.merchantId,
+  client: instruments,
+};
 
 const kernel = {
   pool,
@@ -101,11 +123,43 @@ const mcp = {
   options: {
     merchantId: config.merchantId,
     publicBaseUrl: config.publicBaseUrl,
+    merchantAuthorizeUrl: config.merchantAuthorizeUrl,
     exposed: exposedClasses,
     consent: consentOptions,
     logger: consoleLogger,
   },
 };
+
+/**
+ * Where an agent's purchase becomes a real order in the merchant's own system. Optional:
+ * a merchant with no order API simply does not set it, and the ledger is still complete.
+ */
+const fulfilUrl = process.env.MERCHANT_FULFIL_URL;
+
+/** The shared secret the merchant's own backend uses to reach the kernel. */
+const merchantToken = process.env.AGENTKIT_FULFIL_TOKEN ?? "";
+
+function consentUrlFor(requestRef: string): string {
+  return config.merchantAuthorizeUrl === null
+    ? `${config.publicBaseUrl}/consent/${requestRef}`
+    : `${config.merchantAuthorizeUrl}?ref=${encodeURIComponent(requestRef)}`;
+}
+
+async function recordWithMerchant(intentId: string): Promise<void> {
+  if (fulfilUrl === undefined) return;
+  const result = await fulfil(
+    pool,
+    {
+      merchantId: config.merchantId,
+      fulfilUrl,
+      token: process.env.AGENTKIT_FULFIL_TOKEN ?? "",
+      publicBaseUrl: config.publicBaseUrl,
+      logger: consoleLogger,
+    },
+    intentId,
+  );
+  if (!result.ok) consoleLogger.warn(`order ${intentId} not recorded: ${result.detail}`);
+}
 
 const server = createHttpService([
   {
@@ -155,7 +209,7 @@ const server = createHttpService([
     // MCP over Streamable HTTP. A second door onto the same tools, and the same gate.
     method: "POST",
     path: "/agent/mcp",
-    handler: (ctx) => handleMcp(mcp, ctx),
+    handler: (ctx) => handleMcp({ ...mcp, trustProxy: process.env.TRUST_PROXY === "true" }, ctx),
   },
   {
     // The tool manifest. An agent that cannot discover the tools cannot use them.
@@ -362,6 +416,13 @@ const server = createHttpService([
               ? null
               : `${config.publicBaseUrl}/agent/approve/${decision.challenge_id}`,
           audit_url: `${config.publicBaseUrl}/agent/audit/${decision.intent_id}`,
+          // Present once an intent is authorised: where a person supplies the money for
+          // the order the executor made. An agent can hand this to its user; it cannot
+          // pay it, and nothing on that page comes from the agent.
+          pay_url:
+            decision.verdict === "ALLOW"
+              ? `${config.publicBaseUrl}/pay/${decision.intent_id}`
+              : null,
           ...explain(decision.reason_code),
         },
       };
@@ -379,6 +440,7 @@ const server = createHttpService([
           webhookSecret: config.webhookSecret,
           merchantId: config.merchantId,
           logger: consoleLogger,
+          onCaptured: recordWithMerchant,
         },
         ctx.rawBody,
         typeof signature === "string" ? signature : undefined,
@@ -440,6 +502,22 @@ const server = createHttpService([
     method: "POST",
     path: "/consent/request",
     handler: async (ctx) => {
+      // LMT-005. This endpoint sends a one-time code to a number the caller supplies,
+      // so on a public deployment it is an SMS-bombing primitive if left open.
+      const limit = await consume(
+        pool,
+        config.merchantId,
+        "consent",
+        callerKey(ctx.headers, process.env.TRUST_PROXY === "true"),
+      );
+      if (!limit.allowed) {
+        return {
+          status: 429,
+          headers: { "Retry-After": String(limit.retryAfter) },
+          body: { error: "rate_limited", reason_code: "LMT-005", retry_after_seconds: limit.retryAfter },
+        };
+      }
+
       const parsed = RequestConsentSchema.safeParse(JSON.parse(ctx.rawBody));
       if (!parsed.success) return { status: 400, body: { error: "invalid_request" } };
       const { requestRef } = await requestConsent(pool, consentOptions, parsed.data);
@@ -448,7 +526,9 @@ const server = createHttpService([
         status: 202,
         body: {
           request_ref: requestRef,
-          consent_url: `${config.publicBaseUrl}/consent/${requestRef}`,
+          // Via the merchant when it has a surface that knows the shopper, so the
+          // grant can be bound to them. Straight to the consent screen otherwise.
+          consent_url: consentUrlFor(requestRef),
         },
       };
     },
@@ -472,6 +552,52 @@ const server = createHttpService([
     },
   },
   {
+    // The merchant naming who is approving, and where their order goes.
+    //
+    // Called server-to-server from the merchant's own backend, which knows the logged-in
+    // shopper — something the kernel cannot know, because it serves this screen from a
+    // different origin than the one holding the shopper's session.
+    //
+    // Only accepted before the grant exists. Afterwards the delivery target is fixed:
+    // an agent cannot name an address, so a compromised merchant must not be able to
+    // change one on the agent's behalf either.
+    method: "POST",
+    path: "/consent/:ref/bind",
+    handler: async (ctx) => {
+      if (ctx.headers["x-agentkit-token"] !== merchantToken) {
+        return { status: 401, body: { error: "unauthorised" } };
+      }
+      const body = JSON.parse(ctx.rawBody) as {
+        customer_ref?: string;
+        fulfilment_ref?: string;
+      };
+      if (
+        body.customer_ref === undefined ||
+        body.fulfilment_ref === undefined ||
+        body.customer_ref.length === 0 ||
+        body.fulfilment_ref.length === 0
+      ) {
+        return { status: 400, body: { error: "customer_ref and fulfilment_ref are required" } };
+      }
+
+      const outcome = await bindConsentRefs(pool, consentOptions, ctx.params.ref ?? "", {
+        customerRef: body.customer_ref,
+        fulfilmentRef: body.fulfilment_ref,
+      });
+
+      switch (outcome.kind) {
+        case "BOUND":
+          return { status: 200, body: { bound: true } };
+        case "ALREADY_BOUND":
+          return { status: 409, body: { error: "already_bound", reason_code: "CNS-002" } };
+        case "NOT_PENDING":
+          return { status: 409, body: { error: "not_pending", reason_code: "CNS-002" } };
+        default:
+          return { status: 404, body: { error: "unknown_request" } };
+      }
+    },
+  },
+  {
     method: "GET",
     path: "/consent/:ref",
     handler: async (ctx) => {
@@ -482,10 +608,47 @@ const server = createHttpService([
       if (view.state === "granted") {
         return { status: 200, body: resultPage("Already approved", "This request has already been granted.") };
       }
+      // The merchant's claim about who is approving, carried here by the shopper's own
+      // browser rather than asserted out of band. Binding happens on this request only,
+      // is refused once the grant exists, and is shown to the shopper below so a wrong
+      // one can be caught by the only party able to recognise it.
+      let approving: { name: string; address: string } | undefined;
+      const auth = ctx.query.get("auth");
+      if (auth !== null) {
+        const outcome = verifyAuthorizationToken(merchantToken, auth, view.requestRef);
+        if (outcome.kind !== "VALID") {
+          return {
+            status: 400,
+            body: resultPage(
+              "That link is not valid",
+              "Start again from your account page at the merchant.",
+              outcome.kind.toLowerCase(),
+            ),
+          };
+        }
+        const bound = await bindConsentRefs(pool, consentOptions, view.requestRef, {
+          customerRef: outcome.claims.customerRef,
+          fulfilmentRef: outcome.claims.fulfilmentRef,
+        });
+        // ALREADY_BOUND is not an error here: a shopper refreshing this page must not be
+        // told something went wrong. It is only an error when the claim disagrees, and
+        // the claim cannot change what is already bound.
+        if (bound.kind !== "BOUND" && bound.kind !== "ALREADY_BOUND") {
+          return {
+            status: 409,
+            body: resultPage("Too late", "That request has already been decided."),
+          };
+        }
+        approving = {
+          name: outcome.claims.displayName,
+          address: outcome.claims.displayAddress,
+        };
+      }
+
       const { code } = await sendOtp(pool, consentOptions, view.requestRef);
       return {
         status: 200,
-        body: consentPage(view, code, ctx.query.get("return") ?? undefined),
+        body: consentPage(view, code, ctx.query.get("return") ?? undefined, approving),
       };
     },
   },
@@ -499,16 +662,20 @@ const server = createHttpService([
       }
       const outcome = await verifyAndGrant(pool, consentOptions, ctx.params.ref ?? "", code);
       switch (outcome.kind) {
-        case "GRANTED":
+        case "GRANTED": {
+          // The grant is real from here. What follows is how it gets paid for, and it is
+          // deliberately a separate decision the shopper can decline.
+          const back = ctx.query.get("return");
           return {
-            status: 200,
-            body: resultPage(
-              "Done",
-              "The assistant can now shop for you, within the limits you set.",
-              outcome.mandateId,
-              ctx.query.get("return") ?? undefined,
-            ),
+            status: 303,
+            headers: {
+              Location: `/mandate/${outcome.mandateId}/instrument${
+                back === null ? "" : `?return=${encodeURIComponent(back)}`
+              }`,
+            },
+            body: "",
           };
+        }
         case "WRONG_CODE":
           return { status: 400, body: resultPage("Wrong code", `${outcome.attemptsLeft} attempts left.`) };
         case "EXPIRED":
@@ -522,6 +689,135 @@ const server = createHttpService([
     method: "POST",
     path: "/consent/:ref/reject",
     handler: () => ({ status: 200, body: resultPage("Nothing granted", "No permission was given.") }),
+  },
+  {
+    // Where a person pays for an order their assistant asked for. The rail order already
+    // exists; this only supplies the money, and the webhook is what makes it true.
+    method: "GET",
+    path: "/pay/:intentId",
+    handler: async (ctx) => {
+      const view = await readPayableOrder(pool, config.merchantId, ctx.params.intentId ?? "");
+      if (view === null) {
+        return { status: 404, body: resultPage("Not found", "No order is waiting on payment.") };
+      }
+      if (view.state === "CAPTURED") {
+        return { status: 200, body: resultPage("Already paid", "This order is settled.", view.intentId) };
+      }
+      if (view.railOrderId === null) {
+        return {
+          status: 409,
+          body: resultPage("Not ready", "The order never reached the rail, so there is nothing to pay."),
+        };
+      }
+      return {
+        status: 200,
+        body: payPage(
+          {
+            intentId: view.intentId,
+            merchantName: consentOptions.merchantName,
+            amountPaise: view.amountPaise,
+            railOrderId: view.railOrderId,
+          },
+          await instruments.publishableKey(),
+        ),
+      };
+    },
+  },
+  {
+    method: "GET",
+    path: "/mandate/:id/instrument",
+    handler: async (ctx) => {
+      const mandate = await readMandateForInstrument(instrumentDeps, ctx.params.id ?? "");
+      if (mandate === null) {
+        return { status: 404, body: resultPage("Not found", "That mandate does not exist.") };
+      }
+      if (mandate.tokenId !== null) {
+        return {
+          status: 200,
+          body: resultPage("Already set up", "A way to pay is already attached.", mandate.mandateId),
+        };
+      }
+      const keyId = await instruments.publishableKey();
+      return {
+        status: 200,
+        body: instrumentPage(
+          {
+            mandateId: mandate.mandateId,
+            merchantName: consentOptions.merchantName,
+            agentName: mandate.agentName,
+            maxAmountPaise: bankCeiling(mandate),
+            perTransactionPaise: mandate.perTransactionPaise,
+            ...(ctx.query.get("return") === null
+              ? {}
+              : { returnTo: ctx.query.get("return")! }),
+          },
+          keyId,
+        ),
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/mandate/:id/instrument/start",
+    handler: async (ctx) => {
+      const method = ctx.query.get("method") === "card" ? "card" : "upi";
+      const started = await beginInstrumentSetup(instrumentDeps, ctx.params.id ?? "", method);
+      return started === null
+        ? { status: 404, body: { error: "unknown mandate" } }
+        : {
+            status: 200,
+            body: {
+              customer_id: started.customerId,
+              rail_order_id: started.railOrderId,
+              amount_paise: started.amountPaise,
+            },
+          };
+    },
+  },
+  {
+    method: "POST",
+    path: "/mandate/:id/instrument/complete",
+    handler: async (ctx) => {
+      const outcome = await completeInstrumentSetup(instrumentDeps, ctx.params.id ?? "");
+      switch (outcome.kind) {
+        case "ATTACHED":
+          return { status: 200, body: { attached: true, method: outcome.method } };
+        case "NOT_YET":
+          return {
+            status: 200,
+            body: { attached: false, error: "Your bank has not confirmed the mandate yet." },
+          };
+        default:
+          return { status: 404, body: { attached: false, error: "unknown mandate" } };
+      }
+    },
+  },
+  {
+    method: "POST",
+    path: "/mandate/:id/instrument/skip",
+    handler: (ctx) => ({
+      status: 200,
+      body: resultPage(
+        "Done",
+        "The assistant can shop for you, within the limits you set. It has no way to pay " +
+          "yet, so it will ask you to add one when it needs to.",
+        ctx.params.id,
+        ctx.query.get("return") ?? undefined,
+      ),
+    }),
+  },
+  {
+    method: "GET",
+    path: "/mandate/:id/instrument/done",
+    handler: (ctx) => ({
+      status: 200,
+      body: resultPage(
+        "All set",
+        "Your bank has authorised the mandate. The assistant can now buy within your " +
+          "limits, and you can revoke this at any time.",
+        ctx.params.id,
+      ),
+    }),
   },
   {
     method: "GET",
@@ -558,9 +854,19 @@ const server = createHttpService([
     path: "/agent/approve/:challenge",
     handler: async (ctx) => {
       const decision = await approveStepUp(kernel, ctx.params.challenge ?? "", true);
-      return decision.verdict === "ALLOW"
-        ? { status: 200, body: resultPage("Approved", "Your order is on its way.", decision.intent_id) }
-        : { status: 409, body: resultPage("Could not approve", `This is no longer valid (${decision.reason_code}).`) };
+      if (decision.verdict !== "ALLOW") {
+        return {
+          status: 409,
+          body: resultPage("Could not approve", `This is no longer valid (${decision.reason_code}).`),
+        };
+      }
+      // Approving says the purchase may happen. Paying is a separate act, on a page whose
+      // every figure comes from the order rather than from the agent.
+      return {
+        status: 303,
+        headers: { Location: `/pay/${decision.intent_id}` },
+        body: "",
+      };
     },
   },
 ]);

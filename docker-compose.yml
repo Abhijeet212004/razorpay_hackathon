@@ -28,6 +28,12 @@ x-mode-env: &mode-env
   MERCHANT_ID: ${MERCHANT_ID:-mch_sharma_kirana}
   # The merchant's existing product endpoint. This is the entire integration.
   CATALOG_URL: ${CATALOG_URL:-http://storefront:4000/api/v1/products/all}
+  # Where an agent's purchase becomes a real order in the merchant's own system.
+  MERCHANT_FULFIL_URL: ${MERCHANT_FULFIL_URL:-http://storefront:4000/internal/agent/fulfil}
+  # Where the merchant identifies the shopper before they approve a grant.
+  MERCHANT_AUTHORIZE_URL: ${MERCHANT_AUTHORIZE_URL:-}
+  AGENTKIT_FULFIL_TOKEN: ${AGENTKIT_FULFIL_TOKEN:-fulfil-dev-token}
+  TRUST_PROXY: ${TRUST_PROXY:-false}
   WEBHOOK_SECRET: ${WEBHOOK_SECRET:-whsec_replay_dev_only}
   EXECUTOR_URL: http://executor:8081
   EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:-executor-dev-token}
@@ -91,7 +97,7 @@ services:
     environment:
       <<: [*db-env, *mode-env]
       PORT: "8081"
-      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-}
       RZP_KEY_ID: ${RZP_KEY_ID:-rzp_test_replay}
       RZP_KEY_SECRET: ${RZP_KEY_SECRET:-replay-has-no-real-secret}
     depends_on:
@@ -112,7 +118,7 @@ services:
     environment:
       <<: [*db-env, *mode-env]
       PORT: "8080"
-      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-}
     ports:
       - "58080:8080"
     depends_on:
@@ -135,7 +141,7 @@ services:
     environment:
       <<: [*db-env, *mode-env]
       PORT: "8082"
-      RAIL_BASE_URL: ${RAIL_BASE_URL:-http://replay:8090}
+      RAIL_BASE_URL: ${RAIL_BASE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -229,6 +235,15 @@ services:
       # The human lane. Blank is fine — checkout returns 503 rather than crashing.
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      AGENTKIT_FULFIL_TOKEN: ${AGENTKIT_FULFIL_TOKEN:-fulfil-dev-token}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_MAIL: ${SMTP_MAIL:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      CLOUDINARY_NAME: ${CLOUDINARY_NAME:-}
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY:-}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET:-}
       JWT_EXPIRE: "7d"
       COOKIE_EXPIRE: "7"
       KERNEL_URL: http://kernel:8080

@@ -5,6 +5,7 @@ import { setMerchantContext } from "../../shared/db/merchant-context.js";
 import { silentLogger, type Logger } from "../../shared/logger.js";
 import { paiseToCanonical } from "../../shared/money.js";
 import { append } from "../ledger/ledger.service.js";
+import { releaseReservation } from "../reconciler/reconciler.service.js";
 import { RailTimeoutError, type PaymentRail } from "../rail/rail.validation.js";
 import * as repo from "./executor.repository.js";
 import type {
@@ -72,6 +73,15 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
   ): Promise<void> {
     try {
       await inTransaction(deps.pool, request.merchantId, async (client) => {
+        // FAILED means the rail answered and refused, so the money certainly did not
+        // move and the hold must come back. Releasing changes the cap sum, so it happens
+        // under the mandate row lock like every other write that does.
+        if (state === "FAILED") {
+          await client.query(`SELECT 1 FROM mandates WHERE mandate_id = $1 FOR UPDATE`, [
+            request.mandateId,
+          ]);
+        }
+
         await repo.setOrderState(
           client,
           orderId,
@@ -91,6 +101,30 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
             state,
           },
         });
+
+        // Neither background job covers this: the reaper only reaps reservations with no
+        // order row, and the reconciler only scans non-terminal states. Without this the
+        // hold survives forever and quietly eats the shopper's cap — every rejected call
+        // spending budget on a purchase that never happened.
+        //
+        // AMBIGUOUS deliberately does NOT release. There the rail did not answer, so the
+        // cap must keep assuming the money left.
+        if (state === "FAILED") {
+          const released = await releaseReservation(client, request.intentId, "payment_failed");
+          if (released) {
+            await append(client, {
+              chainId: request.mandateId,
+              kind: "RELEASE",
+              merchantId: request.merchantId,
+              ref: request.intentId,
+              payloadRedacted: {
+                order_id: orderId,
+                reason: "payment_failed",
+                detail: "the rail refused the call, so no money moved",
+              },
+            });
+          }
+        }
       });
     } catch (error) {
       // The payment may already have been made. Losing the record of it is bad, but
@@ -105,8 +139,11 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
       const key = idempotencyKey(request.intentId);
 
       const claimed = await inTransaction(deps.pool, request.merchantId, async (client) => {
+        // Read from the mandate, never from the caller: an instrument supplied in the
+        // request would be an instrument an agent could choose.
+        const instrument = await repo.findPaymentInstrument(client, request.mandateId);
         const existing = await repo.findByIntent(client, request.intentId);
-        if (existing !== null) return { existing, orderId: existing.orderId };
+        if (existing !== null) return { existing, orderId: existing.orderId, instrument };
 
         const orderId = `ord_${randomUUID()}`;
         // Committed before the call. From here on, the absence of this row means the
@@ -122,7 +159,7 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
           railPaymentId: null,
           idempotencyKey: key,
         });
-        return { existing: null, orderId };
+        return { existing: null, orderId, instrument };
       });
 
       if (claimed.existing !== null && claimed.existing.state !== "SUBMITTING") {
@@ -136,12 +173,30 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
         };
       }
 
-      // A row left in SUBMITTING falls through to the call below on purpose. The
-      // idempotency key is sha256(intent_id) and therefore identical, so the rail either
-      // returns the order it already has or creates the one it never did. With a
-      // deterministic idempotency key, re-issuing the create IS the read — this is not a
-      // blind retry and cannot produce a second charge. Do not "fix" it into an early
-      // return.
+      // A row left in SUBMITTING means a call may already have been made and the answer
+      // lost. Before creating anything, ask the rail whether it already has an order for
+      // this intent.
+      //
+      // This used to re-issue the create, on the reasoning that a deterministic
+      // idempotency key makes the create its own read. That is false: Razorpay's Orders
+      // API honours neither X-Razorpay-Idempotency-Key nor a unique receipt, and both
+      // were measured producing duplicate orders against the live API. A duplicate order
+      // is not itself a duplicate charge, but it orphans the first order — and if the
+      // payment lands on that one, its webhook names an order id we hold no row for, the
+      // reservation never captures, and the reaper releases cap for money that moved.
+      if (claimed.existing !== null) {
+        const already = await deps.rail.findOrderByIntent(request.intentId).catch(() => null);
+        if (already !== null) {
+          const state: OrderState = already.status === "paid" ? "CAPTURED" : "SUBMITTED";
+          await recordExecution(request, claimed.orderId, state, already.railOrderId, key);
+          return {
+            orderId: claimed.orderId,
+            state,
+            railOrderId: already.railOrderId,
+            idempotencyKey: key,
+          };
+        }
+      }
 
       // Outside any transaction: the rail call must not hold a database lock either.
       let railOrderId: string | null = null;
@@ -159,9 +214,26 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
             decision_id: request.decisionId,
             amount_paise: paiseToCanonical(request.amountPaise),
           },
+          ...(claimed.instrument === null
+            ? {}
+            : { customerId: claimed.instrument.customerId }),
         });
         railOrderId = railOrder.railOrderId;
         state = "SUBMITTED";
+
+        // With an instrument attached, the order is also paid — no shopper, no PIN, no
+        // screen. Without one the order is created and waits for someone to pay it, which
+        // is what a mandate with no authorised instrument can honestly do.
+        if (claimed.instrument !== null) {
+          const charge = await deps.rail.chargeToken({
+            customerId: claimed.instrument.customerId,
+            tokenId: claimed.instrument.tokenId,
+            railOrderId: railOrder.railOrderId,
+            amountPaise: request.amountPaise,
+            description: `intent ${request.intentId}`,
+          });
+          logger.count(`executor.charge.${charge.status}`);
+        }
       } catch (error) {
         // A timeout means we do not know which side of the rail the money is on, so the
         // order becomes AMBIGUOUS and is resolved by reading. A rejection is terminal.

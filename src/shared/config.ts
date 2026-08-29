@@ -12,12 +12,43 @@ export interface RuntimeConfig {
   readonly executorUrl: string;
   readonly executorToken: string;
   readonly publicBaseUrl: string;
+  /**
+   * Where the merchant identifies the shopper before they approve.
+   *
+   * The kernel serves the consent screen but cannot see who is approving — different
+   * origin, different session. Sending them via the merchant first is what lets the
+   * grant be bound to a real customer and a real address. Unset means a merchant with no
+   * such surface, and consent still works; the mandate simply cannot be fulfilled
+   * against their systems.
+   */
+  readonly merchantAuthorizeUrl: string | null;
 }
 
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (value === undefined) throw new Error(`${name} is not set`);
   return value;
+}
+
+/**
+ * The rail base URL. An empty override counts as unset so a blank compose default falls
+ * through to the right rail rather than producing an empty URL.
+ *
+ * RAIL=razorpay pointed at anything but Razorpay is refused: the kernel would record a
+ * settled payment for money that never moved.
+ */
+function resolveRailBaseUrl(rail: RuntimeConfig["rail"]): string {
+  const override = process.env.RAIL_BASE_URL?.trim();
+  if (override === undefined || override === "") {
+    return rail === "razorpay" ? "https://api.razorpay.com" : "http://replay:8090";
+  }
+  if (rail === "razorpay" && new URL(override).hostname !== "api.razorpay.com") {
+    throw new Error(
+      `RAIL=razorpay requires api.razorpay.com, got ${override}. A recorded rail cannot ` +
+        `settle real money.`,
+    );
+  }
+  return override;
 }
 
 export function loadConfig(): RuntimeConfig {
@@ -35,13 +66,12 @@ export function loadConfig(): RuntimeConfig {
     brain: (process.env.BRAIN ?? "scripted") as RuntimeConfig["brain"],
     verifier,
     merchantId: required("MERCHANT_ID", "mch_sharma_kirana"),
-    railBaseUrl:
-      process.env.RAIL_BASE_URL ??
-      (rail === "razorpay" ? "https://api.razorpay.com" : "http://replay:8090"),
+    railBaseUrl: resolveRailBaseUrl(rail),
     webhookSecret: required("WEBHOOK_SECRET", "whsec_replay_dev_only"),
     executorUrl: required("EXECUTOR_URL", "http://executor:8081"),
     executorToken: required("EXECUTOR_TOKEN", "executor-dev-token"),
     publicBaseUrl: required("PUBLIC_BASE_URL", "http://localhost:8080"),
+    merchantAuthorizeUrl: process.env.MERCHANT_AUTHORIZE_URL?.trim() || null,
   };
 }
 

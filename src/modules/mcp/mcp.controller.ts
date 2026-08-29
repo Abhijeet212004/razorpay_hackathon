@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import type { KernelContext } from "../authorization/authorization.service.js";
 import type { RequestContext } from "../../shared/http.js";
 import { silentLogger } from "../../shared/logger.js";
+import { callerKey, consume } from "../ratelimit/ratelimit.service.js";
 import { callTool, type McpOptions } from "./mcp.service.js";
 import { createSession, resolveSession, revokeSession } from "./mcp.session.js";
 import { toolsFor } from "./mcp.tools.js";
@@ -30,6 +31,17 @@ export interface McpDeps {
   readonly pool: Pool;
   readonly kernel: KernelContext;
   readonly options: McpOptions;
+  /** Only true behind a proxy that overwrites X-Forwarded-For. */
+  readonly trustProxy?: boolean;
+}
+
+/** Which bucket a tool call is charged to. Sending an SMS costs far more than a search. */
+function bucketFor(method: string, toolName?: string): string {
+  if (method === "initialize") return "session";
+  if (toolName === "request_permission") return "consent";
+  if (toolName === "get_quote") return "quote";
+  if (toolName === "purchase" || toolName === "cancel_order") return "mandate";
+  return "agent";
 }
 
 const SESSION_HEADER = "mcp-session-id";
@@ -78,6 +90,21 @@ export async function handleMcp(
     try {
       switch (method) {
         case "initialize": {
+          // Before a session exists the caller is only an address, so this is the one
+          // bucket that has to hold against an anonymous flood.
+          const caller = callerKey(ctx.headers, deps.trustProxy === true);
+          const limit = await consume(deps.pool, deps.options.merchantId, "session", caller);
+          if (!limit.allowed) {
+            logger.count("mcp.rate_limited.session");
+            responses.push(
+              fail(rpcId, RPC.RATE_LIMITED, "too many sessions — try again shortly", {
+                reason_code: "LMT-005",
+                retry_after_seconds: limit.retryAfter,
+              }),
+            );
+            continue;
+          }
+
           const clientName =
             typeof params?.clientInfo === "object" && params.clientInfo !== null
               ? String((params.clientInfo as { name?: unknown }).name ?? "unknown client")
@@ -99,12 +126,20 @@ export async function handleMcp(
                 name: `agentkit · ${deps.options.merchantId}`,
                 version: "1.0.0",
               },
+              // The session's own agent id. A shopper granting permission from the
+              // merchant's site has to be able to name which agent they mean, and the
+              // agent is the only one that knows. Publishing it grants nothing: an id
+              // without a mandate is refused everywhere money is involved.
+              agentId: session.agentId,
               instructions:
                 "You are shopping on behalf of a person. You cannot set prices and you " +
                 "cannot pay without permission they granted. Every purchase returns one " +
                 "of ALLOW, STEP_UP or DENY with a single reason code. STEP_UP means a " +
                 "human must approve — show them the link and stop; it is not a failure " +
-                "and must not be retried. DENY means do not retry the same request.",
+                "and must not be retried. DENY means do not retry the same request. " +
+                `Your agent id is ${session.agentId}. If the shopper wants their order ` +
+                "delivered to a saved address, tell them this id and ask them to grant " +
+                "permission from the merchant's own account page, which binds it to them.",
             }),
           );
           continue;
@@ -154,6 +189,26 @@ export async function handleMcp(
             responses.push(fail(rpcId, RPC.INVALID_PARAMS, "name is required"));
             break;
           }
+
+          // Charged per tool: a search is cheap, an SMS is not.
+          const bucket = bucketFor(method, call.data.name);
+          const limit = await consume(
+            deps.pool,
+            deps.options.merchantId,
+            bucket,
+            session.agentId,
+          );
+          if (!limit.allowed) {
+            logger.count(`mcp.rate_limited.${bucket}`);
+            responses.push(
+              fail(rpcId, RPC.RATE_LIMITED, "you are going too fast — slow down", {
+                reason_code: "LMT-005",
+                retry_after_seconds: limit.retryAfter,
+              }),
+            );
+            break;
+          }
+
           const result = await callTool(
             deps.pool,
             deps.kernel,

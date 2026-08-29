@@ -60,8 +60,9 @@ export async function insert(
     `INSERT INTO mandates (
        mandate_id, merchant_id, subject_pseudonym, agent_id, auth_event_id,
        per_transaction_paise, cumulative_paise, cumulative_window, velocity_per_hour,
-       silent_threshold_paise, scope, state, not_before, not_after, chain_id, kid, signature
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::interval,$9,$10,$11::jsonb,'live',$12,$13,$1,$14,$15)`,
+       silent_threshold_paise, scope, state, not_before, not_after, chain_id, kid, signature,
+       customer_ref, fulfilment_ref
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::interval,$9,$10,$11::jsonb,'live',$12,$13,$1,$14,$15,$16,$17)`,
     [
       mandateId,
       input.merchant_id,
@@ -78,6 +79,8 @@ export async function insert(
       input.not_after,
       kid,
       signature,
+      input.customer_ref ?? null,
+      input.fulfilment_ref ?? null,
     ],
   );
 }

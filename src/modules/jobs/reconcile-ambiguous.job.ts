@@ -3,7 +3,6 @@ import { withAuthorizationTransaction } from "../../shared/db/transaction.js";
 import { append } from "../ledger/ledger.service.js";
 import { releaseReservation } from "../reconciler/reconciler.service.js";
 import * as orders from "../executor/executor.repository.js";
-import type { ExecutorClient } from "../executor/executor.validation.js";
 import type { PaymentRail } from "../rail/rail.validation.js";
 import { JOB_TIMINGS, type JobResult } from "./jobs.validation.js";
 
@@ -13,14 +12,12 @@ import { JOB_TIMINGS, type JobResult } from "./jobs.validation.js";
  * Two ways to read, depending on what we have:
  *
  *   - A rail order id exists, so orders.fetch tells us what happened.
- *   - No rail order id, because the process died mid-call. Then the read is to re-issue
- *     the create with the same deterministic idempotency key, sha256(intent_id). The rail
- *     either returns the order it already has or creates the one it never did.
+ *   - No rail order id, because the process died mid-call. Then we search the rail for an
+ *     order whose notes carry this intent.
  *
- * The second is not a blind retry and does not violate the no-retry rule. That rule
- * forbids an unconditional re-submission which can produce a second charge; an idempotent
- * create keyed on the intent cannot. With a deterministic idempotency key, re-issuing the
- * create IS the read.
+ * Both are reads. Nothing here creates an order: Razorpay's Orders API honours neither an
+ * idempotency key nor a unique receipt, so a create is always a create, and issuing one
+ * to find out what happened would leave a duplicate that a payment could still land on.
  *
  * An order past the maximum age is marked FAILED_UNRESOLVED and its reservation released
  * with an alert — otherwise an unresolvable order would hold cap forever, which is the
@@ -31,7 +28,12 @@ export async function reconcileAmbiguous(
   rail: PaymentRail,
   merchantId: string,
   now: Date = new Date(),
-  executor?: ExecutorClient,
+  /**
+   * Called once a payment is confirmed captured here, exactly as the webhook path does.
+   * Reconciling is the other way an order reaches CAPTURED, and an order that settles
+   * without the merchant hearing about it is money taken for goods nobody ships.
+   */
+  onCaptured?: (intentId: string) => Promise<void>,
 ): Promise<JobResult> {
   const options = {
     merchantId,
@@ -77,22 +79,20 @@ export async function reconcileAmbiguous(
       } catch {
         railStatus = null;
       }
-    } else if (executor !== undefined) {
+    } else {
       // No rail order id: the process died between committing the row and getting an
-      // answer. Re-issuing the create with the same idempotency key is how we find out
-      // which happened.
+      // answer. Searching the notes for the intent tells us whether the call landed,
+      // without risking a second order.
       try {
-        const result = await executor.execute({
-          intentId: order.intent_id,
-          mandateId: order.mandate_id,
-          merchantId,
-          amountPaise: BigInt(order.amount_paise),
-          decisionId: order.order_id,
-        });
-        if (result.railOrderId !== null) {
-          const railOrder = await rail.fetchOrder(result.railOrderId);
-          railStatus = railOrder.status;
-          railPaymentId = railOrder.railPaymentId;
+        const found = await rail.findOrderByIntent(order.intent_id);
+        if (found !== null) {
+          railStatus = found.status;
+          railPaymentId = found.railPaymentId;
+          await withAuthorizationTransaction(pool, options, (client) =>
+            orders.setOrderState(client, order.order_id, "SUBMITTED", {
+              railOrderId: found.railOrderId,
+            }),
+          );
         }
       } catch {
         railStatus = null;
@@ -164,6 +164,12 @@ export async function reconcileAmbiguous(
     if (resolved !== null) {
       changed += 1;
       details.push(`${order.order_id}:${resolved}`);
+
+      // After the transition has committed and outside every lock, like the webhook path.
+      // A merchant that cannot be reached must not roll back a payment that happened.
+      if (resolved === "CAPTURED" && onCaptured !== undefined) {
+        await onCaptured(order.intent_id).catch(() => undefined);
+      }
     }
   }
 

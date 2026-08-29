@@ -56,10 +56,54 @@ export class RailRejectedError extends Error {
     readonly operation: string,
     readonly code: string,
     readonly status: number,
+    /** What the rail actually said. A bare code sends you probing the API by hand. */
+    readonly description?: string,
   ) {
-    super(`rail rejected ${operation}: ${code}`);
+    super(
+      `rail rejected ${operation}: ${code}` +
+        (description === undefined ? "" : ` — ${description}`),
+    );
     this.name = "RailRejectedError";
   }
+}
+
+/**
+ * Setting up an instrument the shopper's bank has agreed may be charged while they are
+ * absent. This happens once, at consent, and only ever with the shopper present.
+ */
+export interface CreateMandateOrderRequest {
+  readonly customerId: string;
+  /** The ceiling the bank records. Our own limits are enforced separately and are lower. */
+  readonly maxAmountPaise: Paise;
+  readonly expiresAt: Date;
+  readonly method: "upi" | "card" | "emandate";
+  /** What is debited to register the mandate. Often the smallest unit the rail allows. */
+  readonly amountPaise: Paise;
+  readonly notes: Readonly<Record<string, string>>;
+}
+
+export interface RailCustomer {
+  readonly customerId: string;
+}
+
+export interface RailToken {
+  readonly tokenId: string;
+  readonly method: string;
+  readonly maxAmountPaise: Paise | null;
+}
+
+/** Charging an instrument with nobody watching. The whole point of the setup above. */
+export interface ChargeTokenRequest {
+  readonly customerId: string;
+  readonly tokenId: string;
+  readonly railOrderId: string;
+  readonly amountPaise: Paise;
+  readonly description: string;
+}
+
+export interface RailCharge {
+  readonly railPaymentId: string;
+  readonly status: string;
 }
 
 export interface PaymentRail {
@@ -67,5 +111,32 @@ export interface PaymentRail {
   createOrder(request: CreateOrderRequest): Promise<RailOrder>;
   /** Re-reads current truth. Ambiguity is resolved by reading, never by retrying. */
   fetchOrder(railOrderId: string): Promise<RailOrder>;
+  /**
+   * Finds an order by the intent that created it, without creating one.
+   *
+   * This is the read used when a call was made but the answer was lost, so no rail order
+   * id was ever stored. Razorpay's Orders API honours neither an idempotency key nor a
+   * unique receipt — both were measured creating duplicates — so re-issuing the create
+   * is not a read. Searching the notes is.
+   *
+   * Bounded to recent orders: it recovers a call made minutes ago, not months.
+   */
+  findOrderByIntent(intentId: string): Promise<RailOrder | null>;
   createRefund(request: CreateRefundRequest): Promise<RailRefund>;
+
+  /** The rail's handle for a shopper. Created once, at consent. */
+  createCustomer(input: {
+    name: string;
+    email: string;
+    contact: string;
+  }): Promise<RailCustomer>;
+
+  /** The order the shopper authorises to register a mandate with their bank. */
+  createMandateOrder(request: CreateMandateOrderRequest): Promise<RailOrder>;
+
+  /** What the bank gave back, once the shopper approved. Null until they have. */
+  findToken(customerId: string): Promise<RailToken | null>;
+
+  /** Debits an authorised instrument. No shopper, no PIN, no screen. */
+  chargeToken(request: ChargeTokenRequest): Promise<RailCharge>;
 }

@@ -136,3 +136,34 @@ export async function setRefundState(
     [refundId, state, railRefundId ?? null],
   );
 }
+
+/** The instrument a mandate may be charged against, if the shopper attached one. */
+export async function findPaymentInstrument(
+  client: PoolClient,
+  mandateId: string,
+): Promise<{ customerId: string; tokenId: string } | null> {
+  const result = await client.query<{
+    payment_customer_ref: string | null;
+    payment_token_ref: string | null;
+  }>(
+    `SELECT payment_customer_ref, payment_token_ref FROM mandates WHERE mandate_id = $1`,
+    [mandateId],
+  );
+  const row = result.rows[0];
+  if (row?.payment_customer_ref == null || row.payment_token_ref == null) return null;
+  return { customerId: row.payment_customer_ref, tokenId: row.payment_token_ref };
+}
+
+/** Records the instrument the shopper authorised. Written once, at consent. */
+export async function attachPaymentInstrument(
+  client: PoolClient,
+  mandateId: string,
+  instrument: { customerId: string; tokenId: string; maxAmountPaise: bigint | null },
+): Promise<void> {
+  await client.query(
+    `UPDATE mandates
+        SET payment_customer_ref = $2, payment_token_ref = $3, payment_max_paise = $4
+      WHERE mandate_id = $1`,
+    [mandateId, instrument.customerId, instrument.tokenId, instrument.maxAmountPaise],
+  );
+}

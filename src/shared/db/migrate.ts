@@ -21,6 +21,29 @@ export async function migrationFiles(): Promise<string[]> {
 }
 
 /**
+ * Apply the named migrations, in order, in one transaction. A partially migrated schema
+ * is worse than an unmigrated one: grants without their tables, or row level security
+ * enabled without the policies that make it mean anything.
+ */
+export async function applyMigrations(
+  client: Client,
+  files: readonly string[],
+): Promise<void> {
+  if (files.length === 0) return;
+  await client.query("BEGIN");
+  try {
+    for (const file of files) {
+      const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+      await client.query(sql);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
+}
+
+/**
  * Apply every migration in order as a superuser, then set role passwords from the
  * supplied map. Passwords never appear in a migration file.
  *

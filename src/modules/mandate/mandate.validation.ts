@@ -25,6 +25,13 @@ export const IssueMandateSchema = z.object({
   limits: MandateLimitsSchema,
   not_before: z.string().datetime({ offset: true }),
   not_after: z.string().datetime({ offset: true }),
+  /**
+   * The merchant's own ids for the shopper and their chosen delivery address. Captured at
+   * consent, when a human is present and the merchant knows who is logged in. The agent
+   * never supplies either, and cannot change them afterwards.
+   */
+  customer_ref: z.string().min(1).max(120).optional(),
+  fulfilment_ref: z.string().min(1).max(120).optional(),
 });
 
 export type IssueMandateInput = z.infer<typeof IssueMandateSchema>;

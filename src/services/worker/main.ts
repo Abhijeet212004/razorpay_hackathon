@@ -7,7 +7,8 @@ import { verifyAndAnchor } from "../../modules/jobs/verify-anchor.job.js";
 import { refreshOperatorMetrics } from "../../modules/console/operator.js";
 import { syncCatalog } from "../../modules/jobs/catalog-sync.job.js";
 import { JOB_TIMINGS } from "../../modules/jobs/jobs.validation.js";
-import { createHttpRail } from "../../modules/rail/rail.http.js";
+import { createExecutorReadRail } from "../../modules/rail/rail.proxy.js";
+import { fulfil } from "../../modules/fulfilment/fulfilment.service.js";
 import { assertNoPaymentCredential } from "../../shared/credentials.js";
 import { loadConfig, poolFor } from "../../shared/config.js";
 import { ROLES } from "../../shared/db/roles.js";
@@ -26,13 +27,38 @@ const config = loadConfig();
 const pool = poolFor(ROLES.worker);
 const kernelPool = poolFor(ROLES.kernel);
 
-const rail = createHttpRail({
+// Reads provider truth through the executor. Razorpay has no read-only key, so holding
+// one here to reconcile would mean holding one that can also charge.
+const rail = createExecutorReadRail({
   mode: config.rail,
-  baseUrl: config.railBaseUrl,
-  keyId: process.env.RZP_READ_KEY_ID ?? "rzp_test_replay",
-  keySecret: process.env.RZP_READ_KEY_SECRET ?? "replay-has-no-real-secret",
+  baseUrl: config.executorUrl,
+  token: config.executorToken,
   timeoutMs: 8000,
 });
+
+/**
+ * The same hand-off the kernel makes when a webhook confirms a capture. Reconciling is
+ * the other way an order reaches CAPTURED — usually because the webhook never arrived —
+ * and it must reach the merchant by the same route, or the shopper has paid for an order
+ * that exists nowhere they can see it.
+ */
+const fulfilUrl = process.env.MERCHANT_FULFIL_URL;
+
+async function recordWithMerchant(intentId: string): Promise<void> {
+  if (fulfilUrl === undefined) return;
+  const result = await fulfil(
+    kernelPool,
+    {
+      merchantId: config.merchantId,
+      fulfilUrl,
+      token: process.env.AGENTKIT_FULFIL_TOKEN ?? "",
+      publicBaseUrl: config.publicBaseUrl,
+      logger: consoleLogger,
+    },
+    intentId,
+  );
+  if (!result.ok) consoleLogger.warn(`order ${intentId} not recorded: ${result.detail}`);
+}
 
 const executor = createExecutorHttpClient({
   baseUrl: config.executorUrl,
@@ -65,7 +91,7 @@ every(JOB_TIMINGS.reaperIntervalMs, "release-stale-reservations", () =>
   releaseStaleReservations(kernelPool, merchant),
 );
 every(30_000, "reconcile-ambiguous", () =>
-  reconcileAmbiguous(kernelPool, rail, merchant, new Date(), executor),
+  reconcileAmbiguous(kernelPool, rail, merchant, new Date(), recordWithMerchant),
 );
 every(60_000, "expire-mandates", () => expireMandates(kernelPool, merchant));
 every(60_000, "expire-challenges", () => expireChallenges(kernelPool, merchant));

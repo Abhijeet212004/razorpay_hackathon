@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo image-check agent mcp
+.PHONY: help up down reset test typecheck invariants verify creds seed-check logs judge prove attack demo image-check agent mcp mcp-connect
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*?## .+$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -61,6 +61,9 @@ seed-check: ## Assert the seed is present and idempotent
 
 demo: ## The four scenarios, end to end against the running stack
 	@node scripts/demo.mjs
+
+mcp-connect: ## Print the Claude Desktop config for this merchant (--write to install)
+	@node scripts/mcp-connect.mjs $${MERCHANT_URL:-http://localhost:58080}
 
 mcp: ## Drive the MCP endpoint the way Claude Desktop would
 	@node scripts/mcp-client.mjs

@@ -1,5 +1,5 @@
 import { Client } from "../../shared/db/pg.js";
-import { migrate } from "../../shared/db/migrate.js";
+import { applyMigrations, migrate, migrationFiles } from "../../shared/db/migrate.js";
 import { ALL_ROLES, type RoleName } from "../../shared/db/roles.js";
 import { seed } from "./seed.js";
 
@@ -33,19 +33,26 @@ await admin.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
 )`);
 
 const applied = await admin.query<{ filename: string }>(`SELECT filename FROM schema_migrations`);
+const already = new Set(applied.rows.map((row) => row.filename));
 
-if (applied.rows.length === 0) {
-  console.log("[bootstrap] applying migrations");
-  const files = await migrate(admin, passwords);
-  for (const file of files) {
+// Whatever is on disk and not yet recorded. Comparing counts instead would mean a new
+// migration never reaches a database that already has some — which is silent, and leaves
+// the schema behind the code that expects it.
+const pending = (await migrationFiles()).filter((file) => !already.has(file));
+
+if (pending.length === 0) {
+  console.log(`[bootstrap] schema up to date at ${already.size} migrations`);
+} else {
+  console.log(`[bootstrap] applying ${pending.length} migration(s): ${pending.join(", ")}`);
+  await applyMigrations(admin, pending);
+  for (const file of pending) {
     await admin.query(`INSERT INTO schema_migrations (filename) VALUES ($1)`, [file]);
   }
-  console.log(`[bootstrap] applied ${files.length} migrations`);
-} else {
-  console.log(`[bootstrap] schema already at ${applied.rows.length} migrations, skipping`);
-  // Passwords are still applied: they come from the environment and may have changed.
-  await migrate(admin, passwords, true);
+  console.log(`[bootstrap] schema now at ${already.size + pending.length} migrations`);
 }
+
+// Passwords come from the environment and may have changed, so they are set every boot.
+await migrate(admin, passwords, true);
 
 await seed(admin, {
   merchantId: process.env.MERCHANT_ID ?? "mch_sharma_kirana",

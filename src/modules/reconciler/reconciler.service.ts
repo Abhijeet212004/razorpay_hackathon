@@ -30,6 +30,12 @@ export interface ReconcilerDeps {
   readonly webhookSecret: string;
   readonly merchantId: string;
   readonly logger?: Logger;
+  /**
+   * Called once a payment is confirmed captured, so the merchant's own system records the
+   * order. It runs after the transition commits: a merchant that cannot be reached must
+   * not roll back a payment that already happened.
+   */
+  readonly onCaptured?: (intentId: string) => Promise<void>;
 }
 
 const TRANSITION_OPTIONS = {
@@ -75,11 +81,21 @@ export async function ingestWebhook(
   const payment = envelope.payload.payment?.entity;
   if (payment === undefined) return { kind: "MALFORMED" };
 
-  return withAuthorizationTransaction(
+  const outcome = await withAuthorizationTransaction(
     deps.pool,
     { merchantId: deps.merchantId, ...TRANSITION_OPTIONS },
     async (client) => applyEvent(deps, client, envelope.id, envelope.event, payment),
   );
+
+  // After the transition has committed, and outside every lock.
+  if (outcome.kind === "APPLIED" && outcome.state === "CAPTURED" && deps.onCaptured) {
+    const { intentId } = outcome;
+    await deps.onCaptured(intentId).catch((error: unknown) => {
+      logger.error(`fulfilment hook failed for ${intentId}`, error);
+    });
+  }
+
+  return outcome;
 }
 
 async function applyEvent(
@@ -112,6 +128,7 @@ async function applyEvent(
     railPaymentId: railOrder.railPaymentId ?? payment.id,
   });
 
+
   if (captured) {
     await repo.captureReservation(client, order.intentId);
   } else {
@@ -143,7 +160,9 @@ async function applyEvent(
     },
   });
 
-  return { kind: "APPLIED", orderId: order.orderId, state };
+  // The intent id travels in the outcome rather than a module-level variable: two
+  // webhooks arriving together must not read each other's.
+  return { kind: "APPLIED", orderId: order.orderId, intentId: order.intentId, state };
 }
 
 /**

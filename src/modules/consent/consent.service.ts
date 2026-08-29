@@ -46,14 +46,16 @@ export async function requestConsent(
     await setMerchantContext(client, options.merchantId);
     await client.query(
       `INSERT INTO consent_requests (request_ref, merchant_id, agent_id, requested_scope,
-         contact, state)
-       VALUES ($1, $2, $3, $4::jsonb, $5, 'pending')`,
+         contact, state, customer_ref, fulfilment_ref)
+       VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', $6, $7)`,
       [
         requestRef,
         options.merchantId,
         input.agent_id,
         JSON.stringify({ scope: input.requested_scope, limits: input.limits }),
         input.contact,
+        input.customer_ref ?? null,
+        input.fulfilment_ref ?? null,
       ],
     );
     await client.query("COMMIT");
@@ -165,6 +167,8 @@ export async function verifyAndGrant(
   let pending: {
     agentId: string;
     contact: string;
+    customerRef: string | null;
+    fulfilmentRef: string | null;
     scope: { merchants: string[]; categories: string[]; currency: "INR" };
     limits: {
       per_transaction_paise: string;
@@ -186,8 +190,11 @@ export async function verifyAndGrant(
       otp_expires_at: Date | null;
       otp_attempts: number;
       requested_scope: { scope: never; limits: never };
+      customer_ref: string | null;
+      fulfilment_ref: string | null;
     }>(
-      `SELECT agent_id, contact, state, otp_hash, otp_expires_at, otp_attempts, requested_scope
+      `SELECT agent_id, contact, state, otp_hash, otp_expires_at, otp_attempts,
+              requested_scope, customer_ref, fulfilment_ref
          FROM consent_requests WHERE request_ref = $1 FOR UPDATE`,
       [requestRef],
     );
@@ -221,6 +228,8 @@ export async function verifyAndGrant(
     pending = {
       agentId: row.agent_id,
       contact: row.contact,
+      customerRef: row.customer_ref,
+      fulfilmentRef: row.fulfilment_ref,
       scope: (row.requested_scope as unknown as { scope: typeof pending.scope }).scope,
       limits: (row.requested_scope as unknown as { limits: typeof pending.limits }).limits,
     };
@@ -270,6 +279,8 @@ export async function verifyAndGrant(
       },
       not_before: now.toISOString(),
       not_after: new Date(now.getTime() + 30 * 86_400_000).toISOString(),
+      ...(pending.customerRef === null ? {} : { customer_ref: pending.customerRef }),
+      ...(pending.fulfilmentRef === null ? {} : { fulfilment_ref: pending.fulfilmentRef }),
     },
   );
 
@@ -320,6 +331,75 @@ export async function consentStatus(
     return row === undefined
       ? null
       : { state: row.state, mandateId: row.mandate_id };
+  } finally {
+    client.release();
+  }
+}
+
+export type BindOutcome =
+  | { kind: "BOUND" }
+  | { kind: "NOT_PENDING" }
+  | { kind: "ALREADY_BOUND" }
+  | { kind: "UNKNOWN" };
+
+/**
+ * Binds a shopper and a delivery address to a consent request that has not been granted
+ * yet.
+ *
+ * The kernel serves the consent screen and the merchant holds the shopper's session;
+ * those are different origins, so the kernel cannot tell who is approving. The merchant
+ * can, and this is how it says so — before the grant exists, never after.
+ *
+ * `state = 'pending'` is the load-bearing part of the WHERE clause. Binding a request
+ * that is already granted would re-point a live mandate at a different shopper or
+ * address, which is the redirect-the-goods attack one level up: the agent cannot name a
+ * delivery address, so a compromised merchant must not be able to change it on the
+ * agent's behalf either. Writing it as a conditional UPDATE rather than a read-then-write
+ * makes the check atomic — two concurrent binds cannot both observe 'pending'.
+ *
+ * What this does NOT verify is that customer_ref really is that shopper. It cannot: the
+ * merchant owns its own customer namespace and these are opaque ids to us. The merchant
+ * guarantees it by taking the id from the session rather than from the request body.
+ */
+export async function bindConsentRefs(
+  pool: Pool,
+  options: ConsentOptions,
+  requestRef: string,
+  refs: { customerRef: string; fulfilmentRef: string },
+): Promise<BindOutcome> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setMerchantContext(client, options.merchantId);
+
+    const bound = await client.query(
+      `UPDATE consent_requests
+          SET customer_ref = $2, fulfilment_ref = $3
+        WHERE request_ref = $1
+          AND state IN ('pending', 'otp_sent')
+          AND customer_ref IS NULL`,
+      [requestRef, refs.customerRef, refs.fulfilmentRef],
+    );
+
+    if (bound.rowCount === 1) {
+      await client.query("COMMIT");
+      return { kind: "BOUND" };
+    }
+
+    // It did not bind. Say why, so the merchant can tell a stale link from a replayed one.
+    const existing = await client.query<{ state: string; customer_ref: string | null }>(
+      `SELECT state, customer_ref FROM consent_requests WHERE request_ref = $1`,
+      [requestRef],
+    );
+    await client.query("COMMIT");
+
+    const row = existing.rows[0];
+    if (row === undefined) return { kind: "UNKNOWN" };
+    if (row.customer_ref !== null) return { kind: "ALREADY_BOUND" };
+    return { kind: "NOT_PENDING" };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
   } finally {
     client.release();
   }

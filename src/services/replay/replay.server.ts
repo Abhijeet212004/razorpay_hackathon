@@ -54,10 +54,13 @@ function signature(secret: string, body: string): string {
 
 export async function startReplayRail(options: ReplayRailOptions): Promise<ReplayRail> {
   const orders = new Map<string, StoredOrder>();
-  /** Idempotency key to order id, which is what makes a replayed intent collapse. */
-  const byIdempotencyKey = new Map<string, string>();
   const idempotencyKeys: string[] = [];
   const refunds = new Map<string, { id: string; status: string; amount: number }>();
+  const customers = new Map<string, { id: string; name: string }>();
+  /** Customer id to the token their bank authorised. Empty until a mandate is approved. */
+  const tokens = new Map<string, { id: string; method: string; max_amount: number }>();
+  /** Mandate registration orders, so settling one produces a token the way a bank would. */
+  const mandateOrders = new Map<string, { customerId: string; maxAmount: number; method: string }>();
 
   let server: Server;
 
@@ -100,6 +103,17 @@ export async function startReplayRail(options: ReplayRailOptions): Promise<Repla
 
     order.status = "paid";
     order.amount_paid = order.amount;
+
+    // The bank has approved the ceiling; from here the instrument can be charged with
+    // nobody watching. This is the moment a real UPI app returns a mandate.
+    const registration = mandateOrders.get(railOrderId);
+    if (registration !== undefined) {
+      tokens.set(registration.customerId, {
+        id: `token_${randomUUID().replaceAll("-", "").slice(0, 14)}`,
+        method: registration.method,
+        max_amount: registration.maxAmount,
+      });
+    }
     await fireWebhook("payment.captured", {
       payment: {
         entity: {
@@ -129,15 +143,21 @@ export async function startReplayRail(options: ReplayRailOptions): Promise<Repla
         const idempotencyKey = typeof key === "string" ? key : undefined;
         if (idempotencyKey !== undefined) idempotencyKeys.push(idempotencyKey);
 
-        // The rail collapses a replayed request into the original order rather than
-        // charging twice. This is the behaviour the idempotency key exists to buy.
-        if (idempotencyKey !== undefined && byIdempotencyKey.has(idempotencyKey)) {
-          const existing = orders.get(byIdempotencyKey.get(idempotencyKey)!)!;
-          send(200, existing);
-          return;
-        }
+        // Deliberately does NOT collapse on the idempotency key. Razorpay's Orders API
+        // ignores it — measured against the live API, two calls with the same key
+        // produced two orders — and a replay rail that dedupes would model a guarantee
+        // the real rail does not give. Duplicate suppression is the executor's job, and
+        // it has to be proven here.
 
-        const body = raw.length > 0 ? (JSON.parse(raw) as { amount: number; notes?: Record<string, string> }) : { amount: 0 };
+        const body = raw.length > 0
+          ? (JSON.parse(raw) as {
+              amount: number;
+              notes?: Record<string, string>;
+              customer_id?: string;
+              method?: string;
+              token?: { max_amount?: number };
+            })
+          : { amount: 0 };
         const id = `order_${randomUUID().replaceAll("-", "").slice(0, 14)}`;
         const order: StoredOrder = {
           id,
@@ -148,13 +168,30 @@ export async function startReplayRail(options: ReplayRailOptions): Promise<Repla
           paymentId: `pay_${randomUUID().replaceAll("-", "").slice(0, 14)}`,
         };
         orders.set(id, order);
-        if (idempotencyKey !== undefined) byIdempotencyKey.set(idempotencyKey, id);
+
+        // An order carrying a token block is a mandate registration: the shopper is about
+        // to approve a ceiling with their bank, not buy anything.
+        if (body.token !== undefined && body.customer_id !== undefined) {
+          mandateOrders.set(id, {
+            customerId: body.customer_id,
+            maxAmount: body.token.max_amount ?? 0,
+            method: body.method ?? "upi",
+          });
+        }
 
         send(200, order);
 
         if (options.goSilent !== true && options.webhookUrl !== undefined) {
           setTimeout(() => void settle(id), options.settleAfterMs ?? 20);
         }
+        return;
+      }
+
+      // GET /v1/orders?count=N — newest first, as Razorpay lists them
+      if (req.method === "GET" && url.pathname === "/v1/orders") {
+        const count = Number(url.searchParams.get("count") ?? 10);
+        const items = [...orders.values()].reverse().slice(0, count);
+        send(200, { entity: "collection", count: items.length, items });
         return;
       }
 
@@ -173,6 +210,63 @@ export async function startReplayRail(options: ReplayRailOptions): Promise<Repla
             items: order.status === "paid" ? [{ id: order.paymentId, status: "captured" }] : [],
           },
         });
+        return;
+      }
+
+      // POST /v1/customers
+      if (req.method === "POST" && url.pathname === "/v1/customers") {
+        const body = raw.length > 0 ? (JSON.parse(raw) as { name?: string }) : {};
+        const id = `cust_${randomUUID().replaceAll("-", "").slice(0, 14)}`;
+        customers.set(id, { id, name: body.name ?? "" });
+        send(200, { id, entity: "customer", name: body.name ?? "" });
+        return;
+      }
+
+      // GET /v1/customers/:id
+      const custMatch = /^\/v1\/customers\/(cust_[A-Za-z0-9]+)$/.exec(url.pathname);
+      if (req.method === "GET" && custMatch !== null) {
+        const found = customers.get(custMatch[1]!);
+        if (found === undefined) {
+          send(404, { error: { code: "BAD_REQUEST_ERROR", description: "no such customer" } });
+          return;
+        }
+        send(200, { ...found, email: "shopper@example.com", contact: "9876543210" });
+        return;
+      }
+
+      // GET /v1/customers/:id/tokens
+      const tokenMatch = /^\/v1\/customers\/(cust_[A-Za-z0-9]+)\/tokens$/.exec(url.pathname);
+      if (req.method === "GET" && tokenMatch !== null) {
+        const token = tokens.get(tokenMatch[1]!);
+        send(200, {
+          entity: "collection",
+          count: token === undefined ? 0 : 1,
+          items: token === undefined ? [] : [token],
+        });
+        return;
+      }
+
+      // POST /v1/payments/create/recurring — a debit with no shopper present
+      if (req.method === "POST" && url.pathname === "/v1/payments/create/recurring") {
+        const body = raw.length > 0
+          ? (JSON.parse(raw) as { order_id?: string; customer_id?: string; token?: string })
+          : {};
+        const order = body.order_id === undefined ? undefined : orders.get(body.order_id);
+        if (order === undefined) {
+          send(400, { error: { code: "BAD_REQUEST_ERROR", description: "no such order" } });
+          return;
+        }
+        // A token that was never authorised cannot be charged, exactly as at a real bank.
+        const held = body.customer_id === undefined ? undefined : tokens.get(body.customer_id);
+        if (held === undefined || held.id !== body.token) {
+          send(400, { error: { code: "BAD_REQUEST_ERROR", description: "token is not authorised" } });
+          return;
+        }
+        // A recurring debit is captured at the rail then and there — there is no shopper
+        // to come back from a bank page. settle() marks it paid before it awaits, so the
+        // order is already truthful by the time this response is written.
+        void settle(order.id);
+        send(200, { id: order.paymentId, status: "captured", order_id: order.id });
         return;
       }
 
