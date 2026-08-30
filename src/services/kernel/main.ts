@@ -20,6 +20,11 @@ import { RequestConsentSchema } from "../../modules/consent/consent.validation.j
 import { consentPage, instrumentPage, payPage, resultPage, stepUpPage } from "../../modules/consent/consent.pages.js";
 import { bindConsentRefs } from "../../modules/consent/consent.service.js";
 import { verifyAuthorizationToken } from "../../modules/consent/authorization-token.js";
+import {
+  refusal,
+  resolveAgentTenant,
+  resolveMerchantTenant,
+} from "../../modules/merchant/merchant.tenant.js";
 import { createInstrumentClient } from "../../modules/consent/instrument.client.js";
 import {
   beginInstrumentSetup,
@@ -44,7 +49,13 @@ import { scriptedVerifier } from "../../modules/verifier/verifier.service.js";
 import { assertNoPaymentCredential } from "../../shared/credentials.js";
 import { loadConfig, poolFor } from "../../shared/config.js";
 import { ROLES } from "../../shared/db/roles.js";
-import { createHttpService, listen } from "../../shared/http.js";
+import {
+  createHttpService,
+  listen,
+  type Handler,
+  type HandlerResult,
+  type RequestContext,
+} from "../../shared/http.js";
 import { consoleLogger } from "../../shared/logger.js";
 import { systemClock } from "../../shared/clock.js";
 
@@ -79,29 +90,73 @@ const instruments = createInstrumentClient({
   token: config.executorToken,
 });
 
-const instrumentDeps = {
-  pool,
-  merchantId: config.merchantId,
-  client: instruments,
-};
+/**
+ * Everything a request needs is built from the merchant it resolved to, not from a global.
+ *
+ * These were module-level singletons baked with one merchant id, which is why the kernel
+ * could only ever serve one tenant however well row level security scoped the tables.
+ * Making them functions is the enforcement: a handler cannot construct its dependencies
+ * without having first resolved a merchant, so forgetting to is a compile error rather
+ * than a silent read of somebody else's data.
+ */
+const verifier = scriptedVerifier();
 
-const kernel = {
+const instrumentDepsFor = (merchantId: string) => ({
   pool,
-  verifier: scriptedVerifier(),
+  merchantId,
+  client: instruments,
+});
+
+const kernelFor = (merchantId: string) => ({
+  pool,
+  verifier,
   clock: systemClock,
   logger: consoleLogger,
   executor,
-  config: { ...DEFAULT_KERNEL_CONFIG, merchantId: config.merchantId },
-};
+  config: { ...DEFAULT_KERNEL_CONFIG, merchantId },
+});
 
 const HTML = { "Content-Type": "text/html; charset=utf-8" };
 
-const consentOptions = {
-  merchantId: config.merchantId,
+/**
+ * A deployment serving one merchant names it here and needs no keys; that is the
+ * self-hosted and demo case. A hosted deployment leaves it unset, and then a request
+ * without a recognised credential resolves to nobody rather than to somebody.
+ */
+const tenantOptions = {
+  pool,
+  defaultMerchantId: process.env.MERCHANT_ID?.trim() || null,
+};
+
+type TenantHandler = (
+  ctx: RequestContext,
+  merchantId: string,
+) => Promise<HandlerResult> | HandlerResult;
+
+/** Agent-facing: the API key decides whose limits bind this request. */
+function agentRoute(handler: TenantHandler): Handler {
+  return async (ctx) => {
+    const outcome = await resolveAgentTenant(tenantOptions, ctx);
+    if (outcome.kind !== "TENANT") return refusal(outcome);
+    return handler(ctx, outcome.merchantId);
+  };
+}
+
+/** The merchant's own backend, which presents a different secret on a different header. */
+function merchantRoute(handler: TenantHandler): Handler {
+  return async (ctx) => {
+    const outcome = await resolveMerchantTenant(tenantOptions, ctx);
+    if (outcome.kind !== "TENANT") return refusal(outcome);
+    return handler(ctx, outcome.merchantId);
+  };
+}
+
+const consentOptionsFor = (merchantId: string) => ({
+  merchantId,
   merchantName: process.env.MERCHANT_NAME ?? "Sharma Kirana",
   otpTtlMs: 5 * 60_000,
   demoMode: process.env.CONSENT_DEMO_MODE !== "false",
-};
+});
 
 /** Parses an HTML form body without pulling in a framework to do it. */
 function form(raw: string): Record<string, string> {
@@ -117,18 +172,18 @@ const exposedClasses = (process.env.MCP_EXPOSE ?? "read,propose,money")
   .map((c) => c.trim())
   .filter((c): c is ToolClass => ["read", "propose", "money", "margin"].includes(c));
 
-const mcp = {
+const mcpFor = (merchantId: string) => ({
   pool,
-  kernel,
+  kernel: kernelFor(merchantId),
   options: {
-    merchantId: config.merchantId,
+    merchantId,
     publicBaseUrl: config.publicBaseUrl,
     merchantAuthorizeUrl: config.merchantAuthorizeUrl,
     exposed: exposedClasses,
-    consent: consentOptions,
+    consent: consentOptionsFor(merchantId),
     logger: consoleLogger,
   },
-};
+});
 
 /**
  * Where an agent's purchase becomes a real order in the merchant's own system. Optional:
@@ -145,12 +200,12 @@ function consentUrlFor(requestRef: string): string {
     : `${config.merchantAuthorizeUrl}?ref=${encodeURIComponent(requestRef)}`;
 }
 
-async function recordWithMerchant(intentId: string): Promise<void> {
+async function recordWithMerchant(merchantId: string, intentId: string): Promise<void> {
   if (fulfilUrl === undefined) return;
   const result = await fulfil(
     pool,
     {
-      merchantId: config.merchantId,
+      merchantId,
       fulfilUrl,
       token: process.env.AGENTKIT_FULFIL_TOKEN ?? "",
       publicBaseUrl: config.publicBaseUrl,
@@ -181,10 +236,12 @@ const server = createHttpService([
   {
     method: "GET",
     path: "/.well-known/agent-commerce.json",
-    handler: () => ({
+    // Public: an agent has no credential yet, which is what this endpoint is for. It
+    // describes the deployment's merchant, or refuses to guess when hosted.
+    handler: agentRoute((_ctx, merchantId) => ({
       status: 200,
       body: {
-        merchant_id: config.merchantId,
+        merchant_id: merchantId,
         transports: ["mcp", "acp", "http"],
         mcp: `${config.publicBaseUrl}/agent/mcp`,
         // One hop from discovery to the full tool surface.
@@ -193,23 +250,25 @@ const server = createHttpService([
         grant_url: `${config.publicBaseUrl}/consent/request`,
         mandate: { shape: "policy-mandate/v1", currency: "INR" },
       },
-    }),
+    })),
   },
   {
     method: "POST",
     path: "/agent/register",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as { name: string; public_key: string };
       const result = await registerAgent(pool, body);
       // Identity, not authority. Every money call still denies until a mandate exists.
       return { status: 201, body: { agent_id: result.agentId, attestation: result.attestation } };
-    },
+    }),
   },
   {
     // MCP over Streamable HTTP. A second door onto the same tools, and the same gate.
     method: "POST",
     path: "/agent/mcp",
-    handler: (ctx) => handleMcp({ ...mcp, trustProxy: process.env.TRUST_PROXY === "true" }, ctx),
+    handler: agentRoute((ctx, merchantId) =>
+      handleMcp({ ...mcpFor(merchantId), trustProxy: process.env.TRUST_PROXY === "true" }, ctx),
+    ),
   },
   {
     // The tool manifest. An agent that cannot discover the tools cannot use them.
@@ -220,42 +279,42 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/agent/catalog/search",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const raw = JSON.parse(ctx.rawBody) as { mandate_id?: string };
       const parsed = CatalogSearchSchema.safeParse(raw);
       if (!parsed.success) return { status: 400, body: { error: "invalid_request" } };
 
       const result = await catalog.search(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         parsed.data,
         raw.mandate_id,
       );
       return { status: 200, body: result };
-    },
+    }),
   },
   {
     method: "GET",
     path: "/agent/catalog/:sku",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const item = await catalog.getItem(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         ctx.params.sku ?? "",
         ctx.query.get("mandate_id") ?? undefined,
       );
       return item === null
         ? { status: 404, body: { error: "unknown_sku", recoverable: true } }
         : { status: 200, body: item };
-    },
+    }),
   },
   {
     method: "GET",
     path: "/agent/mandate/:mandate_id",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const view = await orders.spendRemaining(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         ctx.params.mandate_id ?? "",
       );
       // An unknown mandate and a mandate belonging to another merchant are the same
@@ -263,55 +322,55 @@ const server = createHttpService([
       return view === null
         ? { status: 404, body: { error: "unknown_mandate", reason_code: "MND-001" } }
         : { status: 200, body: view };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/orders/history",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as { mandate_id?: string; limit?: number };
       if (body.mandate_id === undefined) {
         return { status: 400, body: { error: "mandate_id is required" } };
       }
       const list = await orders.history(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         body.mandate_id,
         body.limit ?? 20,
       );
       return { status: 200, body: { orders: list } };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/orders/status",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as { mandate_id?: string; intent_id?: string };
       if (body.mandate_id === undefined || body.intent_id === undefined) {
         return { status: 400, body: { error: "mandate_id and intent_id are required" } };
       }
       const view = await orders.status(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         body.mandate_id,
         body.intent_id,
       );
       return view === null
         ? { status: 404, body: { error: "unknown_order" } }
         : { status: 200, body: view };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/orders/reorder",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as { mandate_id?: string; intent_id?: string };
       if (body.intent_id === undefined) {
         return { status: 400, body: { error: "intent_id is required" } };
       }
       const items = await orders.reorderBasket(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         body.intent_id,
       );
       // Line items only. Quoting them again is a separate call, and it faces every
@@ -320,31 +379,31 @@ const server = createHttpService([
         status: 200,
         body: { items, note: "quote these again; the price and your limits are checked afresh" },
       };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/orders/cancel",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as { mandate_id?: string; intent_id?: string };
       if (body.mandate_id === undefined || body.intent_id === undefined) {
         return { status: 400, body: { error: "mandate_id and intent_id are required" } };
       }
       const outcome = await orders.cancel(
         pool,
-        { merchantId: config.merchantId },
+        { merchantId: merchantId },
         body.mandate_id,
         body.intent_id,
       );
       const status =
         outcome.kind === "CANCELLED" ? 200 : outcome.kind === "NOT_FOUND" ? 404 : 409;
       return { status, body: outcome };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/quote",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const body = JSON.parse(ctx.rawBody) as {
         mandate_id: string;
         items: Array<{ sku: string; quantity: number }>;
@@ -352,7 +411,7 @@ const server = createHttpService([
       try {
         const quote = await priceBasket(
           pool,
-          { merchantId: config.merchantId, quoteTtlMs: DEFAULT_KERNEL_CONFIG.quoteTtlMs },
+          { merchantId: merchantId, quoteTtlMs: DEFAULT_KERNEL_CONFIG.quoteTtlMs },
           { mandateId: body.mandate_id, items: body.items },
         );
         return {
@@ -390,16 +449,16 @@ const server = createHttpService([
         }
         return { status: 400, body: { error: "cannot_quote", recoverable: false } };
       }
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/acp/checkout",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const parsed = AuthorizationRequestSchema.safeParse(JSON.parse(ctx.rawBody));
       if (!parsed.success) return { status: 400, body: { error: "invalid_request" } };
 
-      const decision = await authorize(kernel, parsed.data);
+      const decision = await authorize(kernelFor(merchantId), parsed.data);
 
       // A denial is a 200 with a verdict, not an error. The agent is being told the
       // outcome of a decision, not that its request was malformed.
@@ -426,21 +485,21 @@ const server = createHttpService([
           ...explain(decision.reason_code),
         },
       };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/webhooks/razorpay",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const signature = ctx.headers["x-razorpay-signature"];
       const outcome = await ingestWebhook(
         {
           pool,
           rail,
           webhookSecret: config.webhookSecret,
-          merchantId: config.merchantId,
+          merchantId: merchantId,
           logger: consoleLogger,
-          onCaptured: recordWithMerchant,
+          onCaptured: (intentId: string) => recordWithMerchant(merchantId, intentId),
         },
         ctx.rawBody,
         typeof signature === "string" ? signature : undefined,
@@ -450,7 +509,7 @@ const server = createHttpService([
       return outcome.kind === "UNVERIFIED"
         ? { status: 401, body: { error: "signature_invalid" } }
         : { status: 200, body: outcome };
-    },
+    }),
   },
   {
     // Read-only agent activity, for the merchant's own admin. The console role is
@@ -458,8 +517,8 @@ const server = createHttpService([
     // another merchant's.
     method: "GET",
     path: "/console/:view",
-    handler: async (ctx) => {
-      const merchant = config.merchantId;
+    handler: agentRoute(async (ctx, merchantId) => {
+      const merchant = merchantId;
       switch (ctx.params.view) {
         case "summary": {
           const [decisions, mandates, denials, quarantined] = await Promise.all([
@@ -496,17 +555,17 @@ const server = createHttpService([
         default:
           return { status: 404, body: { error: "unknown_view" } };
       }
-    },
+    }),
   },
   {
     method: "POST",
     path: "/consent/request",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       // LMT-005. This endpoint sends a one-time code to a number the caller supplies,
       // so on a public deployment it is an SMS-bombing primitive if left open.
       const limit = await consume(
         pool,
-        config.merchantId,
+        merchantId,
         "consent",
         callerKey(ctx.headers, process.env.TRUST_PROXY === "true"),
       );
@@ -520,7 +579,7 @@ const server = createHttpService([
 
       const parsed = RequestConsentSchema.safeParse(JSON.parse(ctx.rawBody));
       if (!parsed.success) return { status: 400, body: { error: "invalid_request" } };
-      const { requestRef } = await requestConsent(pool, consentOptions, parsed.data);
+      const { requestRef } = await requestConsent(pool, consentOptionsFor(merchantId), parsed.data);
       // A reference, never a grant.
       return {
         status: 202,
@@ -531,14 +590,14 @@ const server = createHttpService([
           consent_url: consentUrlFor(requestRef),
         },
       };
-    },
+    }),
   },
   {
     // How an agent learns whether it was permitted, without reading the human's screen.
     method: "GET",
     path: "/consent/:ref/status",
-    handler: async (ctx) => {
-      const status = await consentStatus(pool, consentOptions, ctx.params.ref ?? "");
+    handler: agentRoute(async (ctx, merchantId) => {
+      const status = await consentStatus(pool, consentOptionsFor(merchantId), ctx.params.ref ?? "");
       return status === null
         ? { status: 404, body: { error: "unknown_request" } }
         : {
@@ -549,7 +608,7 @@ const server = createHttpService([
               mandate_id: status.mandateId,
             },
           };
-    },
+    }),
   },
   {
     // The merchant naming who is approving, and where their order goes.
@@ -563,7 +622,7 @@ const server = createHttpService([
     // change one on the agent's behalf either.
     method: "POST",
     path: "/consent/:ref/bind",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       if (ctx.headers["x-agentkit-token"] !== merchantToken) {
         return { status: 401, body: { error: "unauthorised" } };
       }
@@ -580,7 +639,7 @@ const server = createHttpService([
         return { status: 400, body: { error: "customer_ref and fulfilment_ref are required" } };
       }
 
-      const outcome = await bindConsentRefs(pool, consentOptions, ctx.params.ref ?? "", {
+      const outcome = await bindConsentRefs(pool, consentOptionsFor(merchantId), ctx.params.ref ?? "", {
         customerRef: body.customer_ref,
         fulfilmentRef: body.fulfilment_ref,
       });
@@ -595,13 +654,13 @@ const server = createHttpService([
         default:
           return { status: 404, body: { error: "unknown_request" } };
       }
-    },
+    }),
   },
   {
     method: "GET",
     path: "/consent/:ref",
-    handler: async (ctx) => {
-      const view = await readConsentRequest(pool, consentOptions, ctx.params.ref ?? "");
+    handler: agentRoute(async (ctx, merchantId) => {
+      const view = await readConsentRequest(pool, consentOptionsFor(merchantId), ctx.params.ref ?? "");
       if (view === null) {
         return { status: 404, body: resultPage("Not found", "That link has expired or never existed.") };
       }
@@ -626,7 +685,7 @@ const server = createHttpService([
             ),
           };
         }
-        const bound = await bindConsentRefs(pool, consentOptions, view.requestRef, {
+        const bound = await bindConsentRefs(pool, consentOptionsFor(merchantId), view.requestRef, {
           customerRef: outcome.claims.customerRef,
           fulfilmentRef: outcome.claims.fulfilmentRef,
         });
@@ -645,22 +704,22 @@ const server = createHttpService([
         };
       }
 
-      const { code } = await sendOtp(pool, consentOptions, view.requestRef);
+      const { code } = await sendOtp(pool, consentOptionsFor(merchantId), view.requestRef);
       return {
         status: 200,
         body: consentPage(view, code, ctx.query.get("return") ?? undefined, approving),
       };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/consent/:ref/verify",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const { code } = form(ctx.rawBody);
       if (code === undefined || !/^[0-9]{6}$/.test(code)) {
         return { status: 400, body: resultPage("Check the code", "Six digits, please.") };
       }
-      const outcome = await verifyAndGrant(pool, consentOptions, ctx.params.ref ?? "", code);
+      const outcome = await verifyAndGrant(pool, consentOptionsFor(merchantId), ctx.params.ref ?? "", code);
       switch (outcome.kind) {
         case "GRANTED": {
           // The grant is real from here. What follows is how it gets paid for, and it is
@@ -683,7 +742,7 @@ const server = createHttpService([
         default:
           return { status: 404, body: resultPage("Not found", "That link has expired or never existed.") };
       }
-    },
+    }),
   },
   {
     method: "POST",
@@ -695,8 +754,8 @@ const server = createHttpService([
     // exists; this only supplies the money, and the webhook is what makes it true.
     method: "GET",
     path: "/pay/:intentId",
-    handler: async (ctx) => {
-      const view = await readPayableOrder(pool, config.merchantId, ctx.params.intentId ?? "");
+    handler: agentRoute(async (ctx, merchantId) => {
+      const view = await readPayableOrder(pool, merchantId, ctx.params.intentId ?? "");
       if (view === null) {
         return { status: 404, body: resultPage("Not found", "No order is waiting on payment.") };
       }
@@ -714,20 +773,20 @@ const server = createHttpService([
         body: payPage(
           {
             intentId: view.intentId,
-            merchantName: consentOptions.merchantName,
+            merchantName: consentOptionsFor(merchantId).merchantName,
             amountPaise: view.amountPaise,
             railOrderId: view.railOrderId,
           },
           await instruments.publishableKey(),
         ),
       };
-    },
+    }),
   },
   {
     method: "GET",
     path: "/mandate/:id/instrument",
-    handler: async (ctx) => {
-      const mandate = await readMandateForInstrument(instrumentDeps, ctx.params.id ?? "");
+    handler: agentRoute(async (ctx, merchantId) => {
+      const mandate = await readMandateForInstrument(instrumentDepsFor(merchantId), ctx.params.id ?? "");
       if (mandate === null) {
         return { status: 404, body: resultPage("Not found", "That mandate does not exist.") };
       }
@@ -743,7 +802,7 @@ const server = createHttpService([
         body: instrumentPage(
           {
             mandateId: mandate.mandateId,
-            merchantName: consentOptions.merchantName,
+            merchantName: consentOptionsFor(merchantId).merchantName,
             agentName: mandate.agentName,
             maxAmountPaise: bankCeiling(mandate),
             perTransactionPaise: mandate.perTransactionPaise,
@@ -754,14 +813,14 @@ const server = createHttpService([
           keyId,
         ),
       };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/mandate/:id/instrument/start",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       const method = ctx.query.get("method") === "card" ? "card" : "upi";
-      const started = await beginInstrumentSetup(instrumentDeps, ctx.params.id ?? "", method);
+      const started = await beginInstrumentSetup(instrumentDepsFor(merchantId), ctx.params.id ?? "", method);
       return started === null
         ? { status: 404, body: { error: "unknown mandate" } }
         : {
@@ -772,13 +831,13 @@ const server = createHttpService([
               amount_paise: started.amountPaise,
             },
           };
-    },
+    }),
   },
   {
     method: "POST",
     path: "/mandate/:id/instrument/complete",
-    handler: async (ctx) => {
-      const outcome = await completeInstrumentSetup(instrumentDeps, ctx.params.id ?? "");
+    handler: agentRoute(async (ctx, merchantId) => {
+      const outcome = await completeInstrumentSetup(instrumentDepsFor(merchantId), ctx.params.id ?? "");
       switch (outcome.kind) {
         case "ATTACHED":
           return { status: 200, body: { attached: true, method: outcome.method } };
@@ -790,12 +849,12 @@ const server = createHttpService([
         default:
           return { status: 404, body: { attached: false, error: "unknown mandate" } };
       }
-    },
+    }),
   },
   {
     method: "POST",
     path: "/mandate/:id/instrument/skip",
-    handler: (ctx) => ({
+    handler: agentRoute((ctx, merchantId) => ({
       status: 200,
       body: resultPage(
         "Done",
@@ -804,12 +863,12 @@ const server = createHttpService([
         ctx.params.id,
         ctx.query.get("return") ?? undefined,
       ),
-    }),
+    })),
   },
   {
     method: "GET",
     path: "/mandate/:id/instrument/done",
-    handler: (ctx) => ({
+    handler: agentRoute((ctx, merchantId) => ({
       status: 200,
       body: resultPage(
         "All set",
@@ -817,18 +876,18 @@ const server = createHttpService([
           "limits, and you can revoke this at any time.",
         ctx.params.id,
       ),
-    }),
+    })),
   },
   {
     method: "GET",
     path: "/agent/approve/:challenge",
-    handler: async (ctx) => {
+    handler: agentRoute(async (ctx, merchantId) => {
       // Rendered from server state only: the amount comes from the challenge row, which
       // came from the signed quote. Nothing the agent wrote appears on this screen.
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        await setMerchantContext(client, config.merchantId);
+        await setMerchantContext(client, merchantId);
         const challenge = await findChallenge(client, ctx.params.challenge ?? "");
         await client.query("COMMIT");
 
@@ -839,7 +898,7 @@ const server = createHttpService([
           status: 200,
           body: stepUpPage({
             challengeId: challenge.challengeId,
-            merchantName: consentOptions.merchantName,
+            merchantName: consentOptionsFor(merchantId).merchantName,
             amountPaise: challenge.amountPaise,
             expiresAt: challenge.expiresAt,
           }),
@@ -847,13 +906,13 @@ const server = createHttpService([
       } finally {
         client.release();
       }
-    },
+    }),
   },
   {
     method: "POST",
     path: "/agent/approve/:challenge",
-    handler: async (ctx) => {
-      const decision = await approveStepUp(kernel, ctx.params.challenge ?? "", true);
+    handler: agentRoute(async (ctx, merchantId) => {
+      const decision = await approveStepUp(kernelFor(merchantId), ctx.params.challenge ?? "", true);
       if (decision.verdict !== "ALLOW") {
         return {
           status: 409,
@@ -867,7 +926,7 @@ const server = createHttpService([
         headers: { Location: `/pay/${decision.intent_id}` },
         body: "",
       };
-    },
+    }),
   },
 ]);
 
