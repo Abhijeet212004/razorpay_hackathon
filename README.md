@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/plates/razorpay-banner.svg" alt="Razorpay" width="360">
+</p>
+
 # AgentKit for Razorpay
 
 **A trust layer for agentic commerce.** It lets any third-party AI agent buy from a
