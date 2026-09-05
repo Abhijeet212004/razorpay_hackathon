@@ -108,11 +108,89 @@ async function resolve(
     : { kind: "SUSPENDED", merchantId: row.merchant_id };
 }
 
+/**
+ * Which merchant does this reference belong to?
+ *
+ * The same question as above, asked of something that is not a credential. A consent ref,
+ * a challenge id and an intent id are random UUIDs owned by exactly one merchant, and the
+ * callers holding them are browsers: a shopper granting a mandate, clearing a step up, or
+ * paying. They present no key, and asking them to would mean handing a shopper an API
+ * credential.
+ *
+ * So the reference decides the tenant. Knowing one is the capability, the way a receipt
+ * link is. These are not hashed, because they are identifiers rather than secrets, and
+ * they return nothing but a merchant id.
+ */
+async function resolveByReference(
+  pool: Pool,
+  fn:
+    | "resolve_merchant_by_consent_ref"
+    | "resolve_merchant_by_challenge"
+    | "resolve_merchant_by_order_intent"
+    | "resolve_merchant_by_mandate"
+    | "resolve_active_merchant",
+  reference: string,
+): Promise<ResolveOutcome> {
+  if (reference.length === 0) return { kind: "UNKNOWN" };
+
+  const result = await pool.query<{ merchant_id: string; state: string }>(
+    `SELECT merchant_id, state FROM ${fn}($1)`,
+    [reference],
+  );
+  const row = result.rows[0];
+  if (row === undefined) return { kind: "UNKNOWN" };
+  return row.state === "active"
+    ? { kind: "RESOLVED", merchantId: row.merchant_id }
+    : { kind: "SUSPENDED", merchantId: row.merchant_id };
+}
+
+export const resolveByConsentRef = (pool: Pool, ref: string): Promise<ResolveOutcome> =>
+  resolveByReference(pool, "resolve_merchant_by_consent_ref", ref);
+
+export const resolveByChallenge = (pool: Pool, challenge: string): Promise<ResolveOutcome> =>
+  resolveByReference(pool, "resolve_merchant_by_challenge", challenge);
+
+export const resolveByOrderIntent = (pool: Pool, intentId: string): Promise<ResolveOutcome> =>
+  resolveByReference(pool, "resolve_merchant_by_order_intent", intentId);
+
+export const resolveByMandate = (pool: Pool, mandateId: string): Promise<ResolveOutcome> =>
+  resolveByReference(pool, "resolve_merchant_by_mandate", mandateId);
+
+/** Discovery only. A merchant id is not a secret; this says whether it exists and is active. */
+export const resolveActiveMerchant = (pool: Pool, merchantId: string): Promise<ResolveOutcome> =>
+  resolveByReference(pool, "resolve_active_merchant", merchantId);
+
 export const resolveByApiKey = (pool: Pool, key: string): Promise<ResolveOutcome> =>
   resolve(pool, "resolve_merchant_by_key", key);
 
 export const resolveByFulfilToken = (pool: Pool, token: string): Promise<ResolveOutcome> =>
   resolve(pool, "resolve_merchant_by_fulfil_token", token);
+
+/**
+ * The key a merchant's authorisation handoffs are signed with.
+ *
+ * It is the stored hash of their fulfil token, which both sides can derive: the merchant
+ * holds the token and hashes it, the kernel holds the hash already. That keeps the token
+ * itself hash-only at rest — nothing here is stored reversibly — while still giving every
+ * merchant a distinct signing key.
+ *
+ * Before this, every handoff was verified against one process-wide secret, so on a hosted
+ * deployment one merchant could mint a token binding a customer at another.
+ *
+ * Returns null for a merchant with no token issued, which is the single-tenant demo case;
+ * the caller falls back to hashing the configured token so both sides still agree.
+ */
+export async function handoffKey(pool: Pool, merchantId: string): Promise<string | null> {
+  // Through a definer function: the caller is verifying a handoff on behalf of a shopper
+  // who has no tenant context, and merchants is under forced row level security. A plain
+  // query here returns nothing and silently falls back to the wrong key.
+  const result = await pool.query<{ merchant_handoff_key: Buffer | null }>(
+    `SELECT merchant_handoff_key($1)`,
+    [merchantId],
+  );
+  const stored = result.rows[0]?.merchant_handoff_key ?? null;
+  return stored === null ? null : stored.toString("hex");
+}
 
 /** Reads a merchant's own row, under their own tenant context. */
 export async function read(client: PoolClient, merchantId: string): Promise<MerchantRecord | null> {

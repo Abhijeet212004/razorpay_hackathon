@@ -220,13 +220,47 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # The adapter, for a merchant who would rather configure than write code.
+  #
+  # Not part of the default stack: the storefront integrates directly, which is the better
+  # path when you can change your application. Start it with --profile adapter.
+  adapter:
+    profiles: ["adapter"]
+    image: ${ADAPTER_IMAGE:-agentkit-adapter:local}
+    build:
+      context: .
+      dockerfile: adapter/Dockerfile
+    environment:
+      AGENTKIT_BASE_URL: http://kernel:8080
+      AGENTKIT_FULFIL_TOKEN: ${AGENTKIT_FULFIL_TOKEN:-fulfil-dev-token}
+      AGENTKIT_API_KEY: ${AGENTKIT_API_KEY:-}
+
+      # The merchant's existing endpoints. These are the storefront's, as an example of a
+      # shop whose field names are not ours.
+      MERCHANT_PRODUCTS_URL: http://storefront:4000/api/v1/products/all
+      MERCHANT_ORDERS_URL: http://storefront:4000/internal/agent/fulfil
+      MERCHANT_SESSION_URL: ${MERCHANT_SESSION_URL:-}
+
+      PRODUCTS_ROOT: ${PRODUCTS_ROOT:-products}
+      PRODUCT_ID: ${PRODUCT_ID:-_id}
+      PRODUCT_NAME: ${PRODUCT_NAME:-name}
+      PRODUCT_CATEGORY: ${PRODUCT_CATEGORY:-category}
+      PRODUCT_PRICE: ${PRODUCT_PRICE:-price}
+      PRODUCT_PRICE_UNIT: ${PRODUCT_PRICE_UNIT:-rupees}
+      PRODUCT_STOCK: ${PRODUCT_STOCK:-stock}
+    ports:
+      - "57000:7000"
+    depends_on:
+      storefront:
+        condition: service_healthy
+
   # Sharma Kirana's shop. An ordinary MERN storefront: catalog, cart, human checkout.
   # The only thing we added is a route.
   storefront:
     image: ${STOREFRONT_IMAGE:-agentkit-storefront:local}
     build:
-      context: ./storefront
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: storefront/Dockerfile
     environment:
       NODE_ENV: production
       PORT: "4000"

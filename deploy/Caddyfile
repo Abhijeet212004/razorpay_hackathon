@@ -1,0 +1,60 @@
+# TLS, and the split between the two things a merchant puts on the internet.
+#
+# The shop is the merchant's own application. The kernel is the trust boundary: it serves
+# the consent screen, the agent surface and the audit record. They are separate names on
+# purpose. An agent is given the kernel's name and never needs to know the shop's, and the
+# consent screen is served from an origin the shop cannot script.
+#
+# Caddy gets certificates from Let's Encrypt on first boot. Both names must already
+# resolve to this host or the challenge fails.
+
+{
+	email {$ACME_EMAIL}
+}
+
+# The merchant's storefront.
+{$SHOP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy storefront:4000
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+# The trust kernel. Agents, shoppers granting consent, and the merchant dashboard.
+#
+# Two processes behind one name. The kernel holds the agent surface and the consent screen;
+# the web service holds the dashboard and the documentation, and reads Postgres as a
+# SELECT-only role. Splitting them by path keeps that separation without asking a merchant
+# to remember two hostnames.
+{$KERNEL_DOMAIN} {
+	encode zstd gzip
+
+	@web path /docs /docs/* /dashboard /dashboard/* /audit /audit/* /operator /operator/* /api/mode
+	reverse_proxy @web web:8083
+
+	reverse_proxy kernel:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# The consent screen must not be frameable: a shopper approving a mandate has to be
+	# able to see which origin is asking.
+	header /consent/* {
+		X-Frame-Options "DENY"
+		Content-Security-Policy "frame-ancestors 'none'"
+	}
+	header /dashboard/* {
+		X-Frame-Options "DENY"
+		Content-Security-Policy "frame-ancestors 'none'"
+	}
+}

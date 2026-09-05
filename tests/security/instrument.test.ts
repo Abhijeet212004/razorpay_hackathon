@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createExecutor } from "../../src/modules/executor/executor.service.js";
 import { createHttpRail } from "../../src/modules/rail/rail.http.js";
+import { RailRejectedError } from "../../src/modules/rail/rail.validation.js";
 import * as executorRepo from "../../src/modules/executor/executor.repository.js";
 import { ROLES } from "../../src/shared/db/roles.js";
 import { startTestDatabase, withMerchantContext, type TestDatabase } from "../support/postgres.js";
@@ -26,11 +27,13 @@ describe("charging a mandate's instrument", () => {
   let db: TestDatabase;
   let rail: TestRail;
   let mandateId: string;
+  let mandateKid: string;
 
   beforeAll(async () => {
     db = await startTestDatabase();
     await seedMerchant(db.superuser);
     const mandateKey = await seedSigningKey(db.superuser, "mandate");
+    mandateKid = mandateKey.kid;
     const agent = await seedAgent(db.superuser);
     const subject = await seedSubject(db.superuser);
     mandateId = await seedMandate(db.superuser, {
@@ -74,6 +77,61 @@ describe("charging a mandate's instrument", () => {
     const order = rail.replay.orders.get(result.railOrderId!);
     // Created, unpaid. An agent with no instrument cannot conjure one.
     expect(order?.status).toBe("created");
+  });
+
+  it("leaves the order payable when the rail refuses the auto-debit", async () => {
+    /**
+     * The order and the debit are two different facts.
+     *
+     * An acquirer can refuse a recurring charge for reasons that have nothing to do with
+     * this order: recurring not enabled on the account, a token the network never
+     * activated, a mandate the issuer dropped. The rail order is still live and payable.
+     *
+     * This used to mark the whole order FAILED and release the hold, so the shopper was
+     * shown a pay page for an order the kernel had already abandoned. They paid, it
+     * captured, and it reconciled against nothing.
+     */
+    const executor = createExecutor({
+      pool: db.as(ROLES.kernel),
+      rail: {
+        ...railClient(),
+        // Order creation succeeds; the debit is refused, as Razorpay does when recurring
+        // is not enabled for the merchant.
+        chargeToken: async () => {
+          throw new RailRejectedError("payments.recurring", "BAD_REQUEST_ERROR", 400, "Payment failed");
+        },
+      },
+    });
+
+    const agent = await seedAgent(db.superuser);
+    const subject = await seedSubject(db.superuser);
+    const withInstrument = await seedMandate(db.superuser, {
+      agentId: agent.agentId,
+      authEventId: subject.authEventId,
+      pseudonym: subject.pseudonym,
+      kid: mandateKid,
+      silentThresholdPaise: 500_000n,
+      cumulativePaise: 5_000_000n,
+      velocityPerHour: 1_000,
+    });
+    await db.superuser.query(
+      `UPDATE mandates SET payment_customer_ref = $2, payment_token_ref = $3, payment_max_paise = $4
+        WHERE mandate_id = $1`,
+      [withInstrument, "cust_x", "token_x", "500000"],
+    );
+
+    const result = await executor.execute({
+      intentId: "int_debit_refused",
+      mandateId: withInstrument,
+      merchantId: MERCHANT_A,
+      amountPaise: 4_500n,
+      decisionId: "dec_debit_refused",
+    });
+
+    // Payable, not failed: the shopper can still pay it and it will reconcile.
+    expect(result.state).toBe("SUBMITTED");
+    expect(result.railOrderId).not.toBeNull();
+    expect(rail.replay.orders.get(result.railOrderId!)?.status).toBe("created");
   });
 
   it("refuses to charge a token the bank never authorised", async () => {

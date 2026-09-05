@@ -24,7 +24,18 @@ const Login = () => {
         dispatch(loginUser(email, password));
     }
 
-    const redirect = location.search ? location.search.split("=")[1] : "account";
+    // Read it properly and decode it. Splitting on "=" kept the encoded value, because a
+    // redirect carrying its own query string has its "=" encoded as %3D, and the result was
+    // then prefixed with another slash: /%2Fagent%2Fauthorize%3Fref%3D...
+    //
+    // Only same-site paths are followed. An absolute URL here would make the login page an
+    // open redirect, which is worth more to an attacker than it sounds: it is a link that
+    // genuinely starts on your domain.
+    const requested = new URLSearchParams(location.search).get("redirect");
+    const redirect =
+        requested && requested.startsWith("/") && !requested.startsWith("//")
+            ? requested
+            : "/account";
 
     useEffect(() => {
         if (error) {
@@ -32,7 +43,7 @@ const Login = () => {
             dispatch(clearErrors());
         }
         if (isAuthenticated) {
-            navigate(`/${redirect}`)
+            navigate(redirect)
         }
     }, [dispatch, error, isAuthenticated, redirect, navigate, enqueueSnackbar]);
 

@@ -220,26 +220,54 @@ export function createExecutor(deps: ExecutorDeps): ExecutorClient {
         });
         railOrderId = railOrder.railOrderId;
         state = "SUBMITTED";
-
-        // With an instrument attached, the order is also paid — no shopper, no PIN, no
-        // screen. Without one the order is created and waits for someone to pay it, which
-        // is what a mandate with no authorised instrument can honestly do.
-        if (claimed.instrument !== null) {
-          const charge = await deps.rail.chargeToken({
-            customerId: claimed.instrument.customerId,
-            tokenId: claimed.instrument.tokenId,
-            railOrderId: railOrder.railOrderId,
-            amountPaise: request.amountPaise,
-            description: `intent ${request.intentId}`,
-          });
-          logger.count(`executor.charge.${charge.status}`);
-        }
       } catch (error) {
         // A timeout means we do not know which side of the rail the money is on, so the
         // order becomes AMBIGUOUS and is resolved by reading. A rejection is terminal.
         state = error instanceof RailTimeoutError ? "AMBIGUOUS" : "FAILED";
         logger.error(`rail ${state} for intent ${request.intentId}`, error);
         logger.count(`executor.rail.${state.toLowerCase()}`);
+      }
+
+      /**
+       * With an instrument attached, try to charge it: no shopper, no PIN, no screen.
+       *
+       * Deliberately outside the block above, because the order and the debit are two
+       * different facts. The order exists and is payable the moment the rail accepts it;
+       * whether the instrument can be charged is a separate question, and one an acquirer
+       * can answer no to for reasons that have nothing to do with this order — recurring
+       * not enabled on the account, a token the network never activated, a mandate the
+       * issuer has since dropped.
+       *
+       * Folding both into one try meant a refused auto-debit marked the whole order FAILED
+       * and released the hold, discarding a rail order that was live and payable. The
+       * shopper was then shown a pay page for an order the kernel had already given up on:
+       * money in, nothing to reconcile it against.
+       *
+       * So a refusal here leaves the order SUBMITTED and the shopper is handed the pay
+       * link. An account where autopay does work never sees this path — it charges and
+       * settles exactly as before.
+       */
+      if (state === "SUBMITTED" && claimed.instrument !== null && railOrderId !== null) {
+        try {
+          const charge = await deps.rail.chargeToken({
+            customerId: claimed.instrument.customerId,
+            tokenId: claimed.instrument.tokenId,
+            railOrderId,
+            amountPaise: request.amountPaise,
+            description: `intent ${request.intentId}`,
+          });
+          logger.count(`executor.charge.${charge.status}`);
+        } catch (error) {
+          if (error instanceof RailTimeoutError) {
+            // We do not know whether the debit landed. Reading resolves it.
+            state = "AMBIGUOUS";
+            logger.error(`charge AMBIGUOUS for intent ${request.intentId}`, error);
+            logger.count("executor.charge.ambiguous");
+          } else {
+            logger.error(`auto-debit refused for intent ${request.intentId}, order stays payable`, error);
+            logger.count("executor.charge.refused");
+          }
+        }
       }
 
       await recordExecution(request, claimed.orderId, state, railOrderId, key);

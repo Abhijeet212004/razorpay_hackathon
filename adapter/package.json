@@ -1,0 +1,16 @@
+{
+  "name": "@agentkit/adapter",
+  "version": "1.0.0",
+  "description": "Translates a merchant's existing product, order and session endpoints into the three contracts AgentKit needs.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@agentkit/merchant": "file:../packages/merchant"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/"
+  }
+}

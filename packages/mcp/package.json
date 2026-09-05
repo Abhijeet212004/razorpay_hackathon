@@ -1,0 +1,11 @@
+{
+  "name": "@agentkit/mcp",
+  "version": "1.0.0",
+  "description": "stdio to HTTP bridge that connects an MCP client such as Claude Desktop to a merchant's AgentKit endpoint.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "agentkit-mcp": "bin/agentkit-mcp.mjs" },
+  "files": ["bin/", "README.md"],
+  "engines": { "node": ">=18" },
+  "keywords": ["mcp", "agentkit", "claude", "agentic-commerce", "stdio"]
+}

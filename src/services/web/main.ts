@@ -7,6 +7,7 @@ import { assertNoPaymentCredential } from "../../shared/credentials.js";
 import { loadConfig, poolFor } from "../../shared/config.js";
 import { ROLES } from "../../shared/db/roles.js";
 import { createHttpService, listen } from "../../shared/http.js";
+import { dashboardRoutes } from "../../modules/dashboard/dashboard.routes.js";
 
 /**
  * Storefront and consoles. Reads Postgres directly as agentkit_console, which is
@@ -30,7 +31,19 @@ function form(raw: string): Record<string, string> {
   return Object.fromEntries(new URLSearchParams(raw).entries());
 }
 
+/**
+ * The merchant dashboard. It signs people in, rotates credentials and saves configuration,
+ * so it uses the kernel role rather than the read-only console one — and every query it
+ * makes still runs under the merchant's own row level security context.
+ */
+const dashboard = dashboardRoutes({
+  pool: kernelPool,
+  apiBase: config.publicBaseUrl,
+  secureCookies: config.publicBaseUrl.startsWith("https://"),
+});
+
 const server = createHttpService([
+  ...dashboard,
   {
     method: "GET",
     path: "/health",

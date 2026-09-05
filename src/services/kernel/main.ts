@@ -1,3 +1,8 @@
+import * as merchants from "../../modules/merchant/merchant.repository.js";
+import type { ResolveOutcome } from "../../modules/merchant/merchant.validation.js";
+import type { Pool } from "pg";
+import * as audit from "../../modules/audit/audit.service.js";
+import { createHash } from "node:crypto";
 import { authorize, DEFAULT_KERNEL_CONFIG } from "../../modules/authorization/authorization.service.js";
 import { AuthorizationRequestSchema } from "../../modules/authorization/authorization.validation.js";
 import { createExecutorHttpClient } from "../../modules/executor/executor.client.js";
@@ -7,6 +12,7 @@ import {
   priceBasket,
 } from "../../modules/quote/quote.service.js";
 import { registerAgent } from "../../modules/identity/identity.service.js";
+import { RegisterAgentSchema } from "../../modules/identity/identity.validation.js";
 import { approveStepUp } from "../../modules/authorization/authorization.service.js";
 import { findChallenge } from "../../modules/authorization/authorization.repository.js";
 import {
@@ -142,6 +148,42 @@ function agentRoute(handler: TenantHandler): Handler {
   };
 }
 
+/**
+ * Shopper-facing: the reference in the URL decides the tenant.
+ *
+ * The caller here is a browser. A shopper granting a mandate, clearing a step up or paying
+ * holds no API key and should never be handed one, so resolving by credential is the wrong
+ * question. Their consent ref, challenge id, intent id or mandate id is a random UUID owned
+ * by exactly one merchant: knowing it is both the identifier and the capability.
+ *
+ * Before this, these routes resolved through the agent door and fell back to MERCHANT_ID,
+ * so a hosted deployment, which sets none, answered 404 to every shopper it had.
+ *
+ * A reference that resolves to nothing is a 404 rather than a 401: the shopper followed a
+ * dead link, and telling them "unauthorised" would be both wrong and alarming.
+ */
+function shopperRoute(
+  resolveBy: (pool: Pool, reference: string) => Promise<ResolveOutcome>,
+  param: string,
+  handler: TenantHandler,
+  { html = true }: { html?: boolean } = {},
+): Handler {
+  return async (ctx) => {
+    const outcome = await resolveBy(pool, ctx.params[param] ?? "");
+    if (outcome.kind === "RESOLVED") return handler(ctx, outcome.merchantId);
+    if (outcome.kind === "SUSPENDED") {
+      return refusal({ kind: "SUSPENDED", merchantId: outcome.merchantId });
+    }
+    return html
+      ? {
+          status: 404,
+          headers: HTML,
+          body: resultPage("Not found", "That link has expired or never existed."),
+        }
+      : { status: 404, body: { error: "not_found" } };
+  };
+}
+
 /** The merchant's own backend, which presents a different secret on a different header. */
 function merchantRoute(handler: TenantHandler): Handler {
   return async (ctx) => {
@@ -150,6 +192,18 @@ function merchantRoute(handler: TenantHandler): Handler {
     return handler(ctx, outcome.merchantId);
   };
 }
+
+/** What an agent needs to get from knowing a merchant to calling one. */
+const manifestFor = (merchantId: string) => ({
+  merchant_id: merchantId,
+  transports: ["mcp", "acp", "http"],
+  mcp: `${config.publicBaseUrl}/agent/mcp`,
+  // One hop from discovery to the full tool surface.
+  tools: `${config.publicBaseUrl}/agent/tools`,
+  register_url: `${config.publicBaseUrl}/agent/register`,
+  grant_url: `${config.publicBaseUrl}/consent/request`,
+  mandate: { shape: "policy-mandate/v1", currency: "INR" },
+});
 
 const consentOptionsFor = (merchantId: string) => ({
   merchantId,
@@ -193,6 +247,19 @@ const fulfilUrl = process.env.MERCHANT_FULFIL_URL;
 
 /** The shared secret the merchant's own backend uses to reach the kernel. */
 const merchantToken = process.env.AGENTKIT_FULFIL_TOKEN ?? "";
+
+/**
+ * The key this merchant's authorisation handoffs are signed with.
+ *
+ * Always sha256 of their fulfil token: taken from the merchant's stored hash when one has
+ * been issued, and derived from the configured token on a single-merchant deployment that
+ * never onboarded through the dashboard. The merchant's SDK hashes the token it holds, so
+ * the two arrive at the same key without the token ever being stored reversibly.
+ */
+async function handoffKeyFor(merchantId: string): Promise<string> {
+  const stored = await merchants.handoffKey(pool, merchantId);
+  return stored ?? createHash("sha256").update(merchantToken, "utf8").digest("hex");
+}
 
 function consentUrlFor(requestRef: string): string {
   return config.merchantAuthorizeUrl === null
@@ -240,24 +307,46 @@ const server = createHttpService([
     // describes the deployment's merchant, or refuses to guess when hosted.
     handler: agentRoute((_ctx, merchantId) => ({
       status: 200,
-      body: {
-        merchant_id: merchantId,
-        transports: ["mcp", "acp", "http"],
-        mcp: `${config.publicBaseUrl}/agent/mcp`,
-        // One hop from discovery to the full tool surface.
-        tools: `${config.publicBaseUrl}/agent/tools`,
-        register_url: `${config.publicBaseUrl}/agent/register`,
-        grant_url: `${config.publicBaseUrl}/consent/request`,
-        mandate: { shape: "policy-mandate/v1", currency: "INR" },
-      },
+      body: manifestFor(merchantId),
     })),
+  },
+  {
+    /**
+     * The same manifest, addressed by merchant.
+     *
+     * An agent knows a merchant as a domain, not as an id, so discovery has to start at
+     * the merchant's own origin: an agent that has heard of sharmakirana.in fetches
+     * https://sharmakirana.in/.well-known/agent-commerce.json. That is what a well-known
+     * URI is for, and it cannot move to a provider's domain, because on the provider's
+     * domain the question "which merchant?" has no answer.
+     *
+     * So a hosted merchant points their own well-known path here. The redirect carries no
+     * credential, which is why the merchant id is in the path: a merchant id is not a
+     * secret and grants nothing on its own.
+     *
+     *   app.get("/.well-known/agent-commerce.json", (req, res) =>
+     *     res.redirect(302, "https://provider/m/mch_yours/.well-known/agent-commerce.json"));
+     */
+    method: "GET",
+    path: "/m/:merchantId/.well-known/agent-commerce.json",
+    handler: async (ctx): Promise<HandlerResult> => {
+      const outcome = await merchants.resolveActiveMerchant(pool, ctx.params.merchantId ?? "");
+      if (outcome.kind !== "RESOLVED") {
+        return outcome.kind === "SUSPENDED"
+          ? refusal({ kind: "SUSPENDED", merchantId: outcome.merchantId })
+          : { status: 404, body: { error: "not_found" } };
+      }
+      return { status: 200, body: manifestFor(outcome.merchantId) };
+    },
   },
   {
     method: "POST",
     path: "/agent/register",
-    handler: agentRoute(async (ctx, merchantId) => {
-      const body = JSON.parse(ctx.rawBody) as { name: string; public_key: string };
-      const result = await registerAgent(pool, body);
+    handler: agentRoute(async (ctx) => {
+      // Validated like every other route: an unparseable key is a 400, not a crash.
+      const parsed = RegisterAgentSchema.safeParse(JSON.parse(ctx.rawBody));
+      if (!parsed.success) return { status: 400, body: { error: "invalid_request" } };
+      const result = await registerAgent(pool, parsed.data);
       // Identity, not authority. Every money call still denies until a mandate exists.
       return { status: 201, body: { agent_id: result.agentId, attestation: result.attestation } };
     }),
@@ -269,6 +358,27 @@ const server = createHttpService([
     handler: agentRoute((ctx, merchantId) =>
       handleMcp({ ...mcpFor(merchantId), trustProxy: process.env.TRUST_PROXY === "true" }, ctx),
     ),
+  },
+  {
+    /**
+     * The public record of one decision.
+     *
+     * Every decision returns an audit_url pointing here. No credential: the reader is a
+     * shopper checking what their assistant did, or a support desk, and neither holds an
+     * API key. The intent id is a random UUID, so knowing it is the capability, the way a
+     * receipt link works. Nothing here is enumerable.
+     *
+     * What it returns is already redacted at write time. It is the decision and its
+     * reasons, not the basket and not the shopper.
+     */
+    method: "GET",
+    path: "/agent/audit/:intentId",
+    handler: async (ctx) => {
+      const record = await audit.record(pool, ctx.params.intentId ?? "");
+      return record === null
+        ? { status: 404, body: { error: "not_found" } }
+        : { status: 200, body: record };
+    },
   },
   {
     // The tool manifest. An agent that cannot discover the tools cannot use them.
@@ -622,8 +732,19 @@ const server = createHttpService([
     // change one on the agent's behalf either.
     method: "POST",
     path: "/consent/:ref/bind",
-    handler: agentRoute(async (ctx, merchantId) => {
-      if (ctx.headers["x-agentkit-token"] !== merchantToken) {
+    handler: merchantRoute(async (ctx, merchantId) => {
+      /**
+       * The merchant door, resolved per merchant rather than against one process-wide
+       * secret. This route was comparing the presented token to AGENTKIT_FULFIL_TOKEN,
+       * which meant every merchant on a hosted deployment shared one, and a merchant's
+       * own issued token did not work at all.
+       *
+       * The header must still be present: merchantRoute falls back to the default tenant
+       * when no credential is offered, which is right for the agent surface on a
+       * single-merchant deployment but wrong for a call that names a customer.
+       */
+      const presented = ctx.headers["x-agentkit-token"];
+      if (presented === undefined || String(presented).length === 0) {
         return { status: 401, body: { error: "unauthorised" } };
       }
       const body = JSON.parse(ctx.rawBody) as {
@@ -659,7 +780,7 @@ const server = createHttpService([
   {
     method: "GET",
     path: "/consent/:ref",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByConsentRef, "ref", async (ctx, merchantId) => {
       const view = await readConsentRequest(pool, consentOptionsFor(merchantId), ctx.params.ref ?? "");
       if (view === null) {
         return { status: 404, body: resultPage("Not found", "That link has expired or never existed.") };
@@ -674,7 +795,7 @@ const server = createHttpService([
       let approving: { name: string; address: string } | undefined;
       const auth = ctx.query.get("auth");
       if (auth !== null) {
-        const outcome = verifyAuthorizationToken(merchantToken, auth, view.requestRef);
+        const outcome = verifyAuthorizationToken(await handoffKeyFor(merchantId), auth, view.requestRef);
         if (outcome.kind !== "VALID") {
           return {
             status: 400,
@@ -714,7 +835,7 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/consent/:ref/verify",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByConsentRef, "ref", async (ctx, merchantId) => {
       const { code } = form(ctx.rawBody);
       if (code === undefined || !/^[0-9]{6}$/.test(code)) {
         return { status: 400, body: resultPage("Check the code", "Six digits, please.") };
@@ -754,13 +875,35 @@ const server = createHttpService([
     // exists; this only supplies the money, and the webhook is what makes it true.
     method: "GET",
     path: "/pay/:intentId",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByOrderIntent, "intentId", async (ctx, merchantId) => {
       const view = await readPayableOrder(pool, merchantId, ctx.params.intentId ?? "");
       if (view === null) {
         return { status: 404, body: resultPage("Not found", "No order is waiting on payment.") };
       }
       if (view.state === "CAPTURED") {
         return { status: 200, body: resultPage("Already paid", "This order is settled.", view.intentId) };
+      }
+      /**
+       * A failed order is not payable, and offering to pay it is worse than useless.
+       *
+       * When execution fails the reservation is released and the intent is finished, so a
+       * payment made here would capture at the rail and reconcile against nothing: money
+       * taken, no order. That is the exact failure this system exists to prevent, and the
+       * page was walking a shopper straight into it.
+       *
+       * Recovery is a new intent, which the agent can propose and which gets its own
+       * reservation and its own rail order. It is not a retry of this one.
+       */
+      if (view.state === "FAILED") {
+        return {
+          status: 409,
+          body: resultPage(
+            "This order did not go through",
+            "The payment attempt failed and the hold was released, so there is nothing to pay here. "
+              + "Ask your assistant to try again and it will start a fresh order.",
+            view.intentId,
+          ),
+        };
       }
       if (view.railOrderId === null) {
         return {
@@ -785,7 +928,7 @@ const server = createHttpService([
   {
     method: "GET",
     path: "/mandate/:id/instrument",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByMandate, "id", async (ctx, merchantId) => {
       const mandate = await readMandateForInstrument(instrumentDepsFor(merchantId), ctx.params.id ?? "");
       if (mandate === null) {
         return { status: 404, body: resultPage("Not found", "That mandate does not exist.") };
@@ -818,7 +961,7 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/mandate/:id/instrument/start",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByMandate, "id", async (ctx, merchantId) => {
       const method = ctx.query.get("method") === "card" ? "card" : "upi";
       const started = await beginInstrumentSetup(instrumentDepsFor(merchantId), ctx.params.id ?? "", method);
       return started === null
@@ -836,7 +979,7 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/mandate/:id/instrument/complete",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByMandate, "id", async (ctx, merchantId) => {
       const outcome = await completeInstrumentSetup(instrumentDepsFor(merchantId), ctx.params.id ?? "");
       switch (outcome.kind) {
         case "ATTACHED":
@@ -854,7 +997,7 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/mandate/:id/instrument/skip",
-    handler: agentRoute((ctx, merchantId) => ({
+    handler: shopperRoute(merchants.resolveByMandate, "id", (ctx, merchantId) => ({
       status: 200,
       body: resultPage(
         "Done",
@@ -868,7 +1011,7 @@ const server = createHttpService([
   {
     method: "GET",
     path: "/mandate/:id/instrument/done",
-    handler: agentRoute((ctx, merchantId) => ({
+    handler: shopperRoute(merchants.resolveByMandate, "id", (ctx, merchantId) => ({
       status: 200,
       body: resultPage(
         "All set",
@@ -881,7 +1024,7 @@ const server = createHttpService([
   {
     method: "GET",
     path: "/agent/approve/:challenge",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByChallenge, "challenge", async (ctx, merchantId) => {
       // Rendered from server state only: the amount comes from the challenge row, which
       // came from the signed quote. Nothing the agent wrote appears on this screen.
       const client = await pool.connect();
@@ -911,7 +1054,7 @@ const server = createHttpService([
   {
     method: "POST",
     path: "/agent/approve/:challenge",
-    handler: agentRoute(async (ctx, merchantId) => {
+    handler: shopperRoute(merchants.resolveByChallenge, "challenge", async (ctx, merchantId) => {
       const decision = await approveStepUp(kernelFor(merchantId), ctx.params.challenge ?? "", true);
       if (decision.verdict !== "ALLOW") {
         return {

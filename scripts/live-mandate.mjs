@@ -23,8 +23,10 @@ const env = Object.fromEntries(
     .map((l) => /^([A-Z_]+)=(.*)$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2]]),
 );
 
-const KEY = env.RZP_LIVE_KEY_ID;
-const SECRET = env.RZP_LIVE_KEY_SECRET;
+// Test mode by default; pass --live to use the live credentials instead.
+const LIVE = process.argv.includes("--live");
+const KEY = LIVE ? env.RZP_LIVE_KEY_ID : env.RZP_KEY_ID;
+const SECRET = LIVE ? env.RZP_LIVE_KEY_SECRET : env.RZP_KEY_SECRET;
 const METHOD = process.argv[2] === "card" ? "card" : "upi";
 const MAX_PAISE = Number(process.argv[3] ?? 100000);   // the ceiling the bank records
 const PORT = Number(process.argv[4] ?? 59000);
@@ -34,7 +36,7 @@ if (!KEY || !SECRET) {
   console.error("  add RZP_LIVE_KEY_ID and RZP_LIVE_KEY_SECRET to .env first");
   process.exit(1);
 }
-if (!KEY.startsWith("rzp_live_")) {
+if (LIVE && !KEY.startsWith("rzp_live_")) {
   console.error(`  RZP_LIVE_KEY_ID does not look live (${KEY.slice(0, 9)}…) — refusing`);
   process.exit(1);
 }
@@ -49,8 +51,8 @@ const api = async (path, body) => {
   return { status: r.status, body: await r.json().catch(() => ({})) };
 };
 
-console.log(`\n  LIVE MODE — key ${KEY.slice(0, 13)}…`);
-console.log(`  ₹${REGISTER_PAISE / 100} will actually be charged to authorise the mandate.`);
+console.log(`\n  ${LIVE ? "LIVE MODE" : "TEST MODE"} — key ${KEY.slice(0, 13)}…`);
+console.log(`  ₹${REGISTER_PAISE / 100} ${LIVE ? "will actually be charged" : "is simulated"} to authorise the mandate.`);
 console.log(`  method: ${METHOD}   ceiling recorded with the bank: ₹${MAX_PAISE / 100}\n`);
 
 // A fresh customer each run. fail_existing:"0" returns the existing one for a repeated

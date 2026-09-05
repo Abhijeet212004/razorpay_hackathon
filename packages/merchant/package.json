@@ -1,0 +1,21 @@
+{
+  "name": "@agentkit/merchant",
+  "version": "1.0.0",
+  "description": "Server-side SDK for integrating an AgentKit trust kernel: agent identity, signed intents, quotes and consent.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "lib/", "README.md"],
+  "engines": { "node": ">=18" },
+  "keywords": ["agentkit", "agentic-commerce", "razorpay", "mandate", "mcp"],
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

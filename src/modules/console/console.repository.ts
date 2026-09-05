@@ -139,6 +139,64 @@ export async function trace(
   });
 }
 
+/** The whole chain an intent sits on, with the raw hashes, for recomputation. */
+export interface ChainEntry {
+  seq: number;
+  kind: string;
+  createdAt: Date;
+  ref: string | null;
+  /** Exactly the object that was hashed: envelope and all, not just the inner payload. */
+  hashedPayload: unknown;
+  prevHash: Buffer;
+  hash: Buffer;
+}
+
+/**
+ * Every entry on the chain that contains this intent, oldest first.
+ *
+ * `trace` returns the inner payload, which is what a reader wants. This returns the whole
+ * envelope and both hashes, because verifying the chain means hashing exactly the bytes
+ * that were hashed originally, not a convenient subset of them.
+ */
+export async function chainForIntent(
+  pool: Pool,
+  merchantId: string,
+  intentId: string,
+): Promise<{ chainId: string | null; entries: ChainEntry[] }> {
+  return scoped(pool, merchantId, async (client) => {
+    const found = await client.query<{ chain_id: string }>(
+      `SELECT chain_id FROM ledger WHERE ref = $1 LIMIT 1`,
+      [intentId],
+    );
+    const chainId = found.rows[0]?.chain_id ?? null;
+    if (chainId === null) return { chainId: null, entries: [] };
+
+    const result = await client.query<{
+      seq: string; kind: string; created_at: Date; ref: string | null;
+      payload_redacted: unknown; prev_hash: Buffer; hash: Buffer;
+    }>(
+      // ledger.seq, not the alias: ORDER BY binds to the output column, and the alias is
+      // the ::text cast, which sorts 0, 1, 10, 11, 2 and walks the chain out of order.
+      `SELECT seq::text AS seq, kind, created_at, ref, payload_redacted, prev_hash, hash
+         FROM ledger WHERE chain_id = $1 ORDER BY ledger.seq`,
+      [chainId],
+    );
+
+    return {
+      chainId,
+      entries: result.rows.map((r) => ({
+        seq: Number(r.seq),
+        kind: r.kind,
+        createdAt: r.created_at,
+        ref: r.ref,
+        hashedPayload: r.payload_redacted,
+        prevHash: r.prev_hash,
+        hash: r.hash,
+      })),
+    };
+  });
+}
+
 export async function denialCounts(
   pool: Pool,
   merchantId: string,

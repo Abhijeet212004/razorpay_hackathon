@@ -58,6 +58,29 @@ export function createHttpService(routes: readonly Route[]): Server {
           const params = match(route.path, url.pathname);
           if (params === null) continue;
 
+          /**
+           * A body that claims to be JSON and is not is the caller's mistake, not ours.
+           *
+           * Every handler parses ctx.rawBody itself, because a webhook signature is over
+           * the exact bytes rather than a re-encode. Left to them, a malformed body threw
+           * inside the handler and surfaced as 500 — the same status the caller would see
+           * if the kernel were broken. Rejecting it here means one answer, in one place,
+           * for every route.
+           *
+           * Only bodies that declare JSON are checked: form posts and empty bodies are
+           * none of this function's business.
+           */
+          const contentType = req.headers["content-type"] ?? "";
+          if (rawBody.length > 0 && contentType.includes("application/json")) {
+            try {
+              JSON.parse(rawBody);
+            } catch {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "invalid_json" }));
+              return;
+            }
+          }
+
           try {
             const result = await route.handler({
               method: req.method ?? "GET",
